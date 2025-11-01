@@ -84,8 +84,12 @@ def load_goemotions(
         Unified DataFrame with 'text' column and Plutchik emotion labels.
     """
 
+    # Load all CSV shards into separate DataFrames
+    # GoEmotions is split across 3 files for easier distribution
     frames: list[DataFrame] = []
     for path in paths:
+        # multiLine=True: handles text with embedded newlines (e.g., Reddit posts)
+        # escape='"': properly handles quoted text containing commas
         frames.append(
             spark.read.option("header", True)
             .option("multiLine", True)
@@ -93,29 +97,45 @@ def load_goemotions(
             .csv(path)
         )
 
+    # Vertically stack all CSV shards into a single DataFrame
+    # unionByName ensures columns match by name (robust to column ordering)
     df = frames[0]
     for other in frames[1:]:
         df = df.unionByName(other)
 
+    # Remove examples flagged by annotators as ambiguous or unclear
+    # This improves data quality by filtering out confusing edge cases
     df = filter_unclear_examples(df)
 
+    # Select only the columns we need: text + all emotion labels
+    # Keep 'id' if present for traceability during debugging
     columns = ["text"] + GOEMOTIONS_LABELS
     if "id" in df.columns:
         columns.insert(0, "id")
     df = df.select(*columns)
 
+    # Cast all emotion labels from string/int to double for ML compatibility
+    # Spark MLlib requires numeric label columns as DoubleType
     for label in GOEMOTIONS_LABELS:
         df = df.withColumn(label, F.col(label).cast("double"))
 
+    # Some texts have multiple rater annotations - aggregate them
+    # This consolidates multiple rows per text into a single canonical row
     df = aggregate_rater_annotations(df)
 
+    # Map 27 fine-grained GoEmotions labels → 8 coarse Plutchik emotions
+    # This reduces dimensionality and aligns with established emotion theory
     df = project_to_plutchik(df)
 
+    # Optional: subsample the dataset for faster local experimentation
+    # Useful during development to iterate quickly on a smaller dataset
     if config.sample_fraction is not None and 0 < config.sample_fraction < 1:
         df = df.sample(
             withReplacement=False, fraction=config.sample_fraction, seed=config.seed
         )
 
+    # Final cleanup: remove any rows with null text, ensure text is string type
+    # dropna prevents downstream errors from missing text
     return df.dropna(subset=["text"]).withColumn("text", F.col("text").cast("string"))
 
 
@@ -162,17 +182,28 @@ def stratified_split(
         Tuple of (train_df, validation_df, test_df).
     """
 
+    # Fast path: simple random split when stratification is disabled
+    # Useful for quick experiments or when class balance isn't critical
     if not config.stratify:
         splits = df.randomSplit(
             [config.train_ratio, config.val_ratio, config.test_ratio], seed=config.seed
         )
         return tuple(splits)  # type: ignore[return-value]
 
+    # Compute the "primary" emotion for each text (used for stratification)
+    # This ensures that rare emotions like 'trust' or 'surprise' appear in all splits
     df = compute_primary_label(df)
 
+    # Create a ranking within each emotion group using a window function
+    # This allows us to split proportionally within each emotion category
+    # rand() ensures randomized ordering within each partition
     window = Window.partitionBy("primary_label").orderBy(F.rand(seed=config.seed))
+    # percent_rank() assigns a value 0-1 representing relative position in group
     ranked = df.withColumn("rank", F.percent_rank().over(window))
 
+    # Split based on cumulative percentile rank within each emotion group
+    # Example: rank <= 0.7 means "first 70% of examples within this emotion"
+    # This maintains emotion distribution across splits (stratification)
     train = ranked.filter(F.col("rank") <= config.train_ratio).drop("rank")
     val = ranked.filter(
         (F.col("rank") > config.train_ratio)
@@ -182,6 +213,8 @@ def stratified_split(
         "rank"
     )
 
+    # Remove the temporary stratification column before returning
+    # Clean output DataFrames should only contain original columns
     return (
         train.drop("primary_label"),
         val.drop("primary_label"),
@@ -350,15 +383,27 @@ def project_to_plutchik(df: DataFrame) -> DataFrame:
     """
 
     projected = df
+    # For each of the 8 Plutchik emotions (joy, trust, fear, etc.)
     for target, source_labels in PLUTCHIK_TO_GOEMOTIONS.items():
+        # Collect all source labels that map to this Plutchik emotion
+        # Example: joy ← [amusement, excitement, joy, optimism, pride, relief]
         available = [F.col(label) for label in source_labels if label in df.columns]
+
+        # If no source labels exist in the data, default to 0 (not present)
         if not available:
             projected = projected.withColumn(target, F.lit(0.0))
             continue
+
+        # If only one source label, use it directly (no aggregation needed)
         if len(available) == 1:
             combined = available[0]
         else:
+            # Multiple source labels: take the MAXIMUM across them
+            # Rationale: if ANY fine-grained emotion is present, the broader emotion is present
+            # Example: joy=1 if amusement=1 OR excitement=1 OR joy=1 OR ...
             combined = F.greatest(*available)
+
+        # Cast to double and handle nulls (coalesce replaces null with 0.0)
         projected = projected.withColumn(
             target,
             F.coalesce(combined.cast("double"), F.lit(0.0)),
@@ -403,9 +448,19 @@ def aggregate_rater_annotations(df: DataFrame) -> DataFrame:
         Deduplicated DataFrame with aggregated labels.
     """
 
+    # Group by unique text identifiers (id and text content)
+    # This handles cases where the same text was shown to multiple annotators
     group_cols = ["id", "text"]
+
+    # For each emotion label, take the MAX across all raters
+    # Rationale: if ANY rater detected the emotion, we consider it present
+    # This is conservative - captures emotion if at least one human saw it
+    # Example: If 3 raters annotate "I'm happy!" and 2 mark joy=1, result is joy=1
     aggregations = [F.max(F.col(label)).alias(label) for label in GOEMOTIONS_LABELS]
     aggregated = df.groupBy(*group_cols).agg(*aggregations)
+
+    # Drop the 'id' column as it was only needed for grouping
+    # Final output: one row per unique text with aggregated labels
     aggregated = aggregated.drop("id")
 
     return aggregated

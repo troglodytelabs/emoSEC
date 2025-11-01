@@ -94,8 +94,14 @@ class EvaluationManager:
             logger.warning("No valid threshold candidates provided; skipping tuning")
             return tuned
 
+        # For each emotion, search over threshold candidates to find optimal F1
+        # Different emotions have different class imbalances, so optimal thresholds vary
+        # Example: rare emotions (fear) may need lower thresholds to avoid missing them
         for label in self.label_cols:
             prob_col = f"prob_{model_type}_{label}"
+
+            # Skip labels where model doesn't provide probability scores
+            # (e.g., LinearSVC only provides raw decision margins)
             if prob_col not in validation_predictions.columns:
                 logger.debug(
                     "Model '%s' lacks probability column for '%s'; retaining threshold %.3f",
@@ -111,10 +117,15 @@ class EvaluationManager:
                 label,
                 len(valid_candidates),
             )
+
+            # Extract probability scores as scalar column (handle vector format)
             probability_expr = _ensure_scalar_probability(
                 validation_predictions, prob_col
             ).alias("probability")
 
+            # Evaluate each threshold candidate on validation data
+            # For each threshold, compute TP, FP, FN, and F1 score
+            # Grid search: try all candidates and pick the one with best F1
             candidate_stats = _evaluate_threshold_grid(
                 validation_predictions.select(
                     F.col(label).cast("double").alias("target"),
@@ -123,6 +134,9 @@ class EvaluationManager:
                 valid_candidates,
             )
 
+            # Select the threshold with highest F1 score
+            # Ties are broken by recall (prefer higher recall), then lower threshold
+            # Rationale: Better to detect more emotions (high recall) than miss them
             best_threshold, best_score = _select_best_threshold(candidate_stats)
             logger.debug(
                 "Selected threshold %.3f for '%s' (F1=%.4f)",
@@ -132,6 +146,7 @@ class EvaluationManager:
             )
             tuned[label] = best_threshold
 
+        # Update internal state with tuned thresholds
         self.thresholds = tuned
         return tuned
 
@@ -285,43 +300,60 @@ def _evaluate_threshold_grid(
 ) -> Dict[float, Dict[str, float]]:
     """Compute confusion-matrix statistics for each threshold candidate."""
 
+    # Generate unique aliases for each threshold to avoid Spark column name conflicts
+    # Example: threshold 0.45 → "thr_0_45"
     candidate_alias = {
         candidate: _threshold_alias(candidate) for candidate in candidates
     }
+
     agg_exprs = []
     probability = F.col("probability")
     target = F.col("target")
 
+    # For each threshold, compute TP, FP, FN in a single aggregation pass
+    # This is much more efficient than looping and computing separately
     for candidate, alias in candidate_alias.items():
+        # prediction = 1 if probability >= threshold, else 0
         prediction = probability >= F.lit(candidate)
+
         agg_exprs.extend(
             [
+                # True Positive: predicted positive AND actually positive
                 F.sum(F.when(prediction & (target == 1.0), 1).otherwise(0)).alias(
                     f"tp_{alias}"
                 ),
+                # False Positive: predicted positive BUT actually negative
                 F.sum(F.when(prediction & (target == 0.0), 1).otherwise(0)).alias(
                     f"fp_{alias}"
                 ),
+                # False Negative: predicted negative BUT actually positive
                 F.sum(F.when(~prediction & (target == 1.0), 1).otherwise(0)).alias(
                     f"fn_{alias}"
                 ),
             ]
         )
 
+    # Execute all threshold evaluations in one pass (efficient!)
     stats_row = df.agg(*agg_exprs).collect()[0].asDict()
 
+    # Calculate precision, recall, F1 for each threshold
     results: Dict[float, Dict[str, float]] = {}
     for candidate, alias in candidate_alias.items():
         tp = float(stats_row.get(f"tp_{alias}", 0.0))
         fp = float(stats_row.get(f"fp_{alias}", 0.0))
         fn = float(stats_row.get(f"fn_{alias}", 0.0))
+
+        # Precision: correct positives / all predicted positives
         precision = _safe_divide(tp, tp + fp)
+        # Recall: correct positives / all actual positives
         recall = _safe_divide(tp, tp + fn)
+        # F1: harmonic mean of precision and recall
         f1 = (
             _safe_divide(2 * precision * recall, precision + recall)
             if precision or recall
             else 0.0
         )
+
         results[candidate] = {
             "tp": tp,
             "fp": fp,
@@ -334,18 +366,29 @@ def _evaluate_threshold_grid(
 
 
 def _select_best_threshold(stats: Dict[float, Dict[str, float]]) -> tuple[float, float]:
-    """Pick the threshold with the highest F1 (ties resolved by recall, then lower threshold)."""
+    """Pick the threshold with the highest F1 (ties resolved by recall, then lower threshold).
 
-    best_threshold = 0.5
+    Tie-breaking rationale:
+    1. Prefer higher F1 (primary metric)
+    2. If F1 is tied, prefer higher recall (better to detect emotion than miss it)
+    3. If still tied, prefer lower threshold (more inclusive, less likely to miss)
+    """
+
+    best_threshold = 0.5  # Default fallback
     best_f1 = -1.0
     best_recall = -1.0
+
+    # Sort by threshold value to ensure consistent tie-breaking
     for candidate, metrics in sorted(stats.items()):
         f1 = metrics.get("f1", 0.0)
         recall = metrics.get("recall", 0.0)
+
+        # Update best if: F1 is better, OR F1 is tied but recall is better
         if f1 > best_f1 or (f1 == best_f1 and recall > best_recall):
             best_threshold = candidate
             best_f1 = f1
             best_recall = recall
+
     return best_threshold, best_f1
 
 

@@ -221,7 +221,6 @@ class DemoEngine:
             entry: Dict[str, object] = {
                 "text": row_dict["text"],
                 "predictions": [],
-                "thresholds": dict(thresholds),
             }
             positive_labels: List[str] = []
             scored_labels: List[Dict[str, object]] = []

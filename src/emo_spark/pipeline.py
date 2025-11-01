@@ -220,6 +220,20 @@ def run_pipeline(
             tuned_thresholds[model_type] = thresholds_used
             threshold_paths[model_type] = thresholds_path
 
+        # ============================================================
+        # OPTIONAL: MAJORITY VOTE ENSEMBLE
+        # ============================================================
+        # If we trained 2+ base model families, create an ensemble
+        # that combines their predictions via majority voting
+        #
+        # Example: If logistic regression, SVM, and random forest all predict joy=1,
+        #          the ensemble has high confidence. If only 1 predicts joy=1,
+        #          the ensemble may abstain or have lower confidence.
+        #
+        # Majority vote benefits:
+        # - Reduces individual model biases
+        # - Often improves overall F1 score
+        # - No additional training required (reuses existing predictions)
         base_model_types = list(model_results.keys())
         if len(base_model_types) > 1:
             logger.info(
@@ -227,6 +241,7 @@ def run_pipeline(
                 ", ".join(base_model_types),
             )
             try:
+                # Build ensemble by aggregating predictions from all base models
                 voting_model_set = _build_majority_vote_ensemble(
                     {name: model_results[name] for name in base_model_types},
                     trainer.label_cols,
@@ -235,8 +250,10 @@ def run_pipeline(
             except ValueError as exc:
                 logger.warning("Skipping majority vote ensemble creation: %s", exc)
             else:
+                # Store the ensemble as another "model" for evaluation
                 model_results["majority_vote"] = voting_model_set
 
+                # Save ensemble predictions to disk for future use
                 prediction_dir = _build_output_path(config.output_path, "predictions")
                 save_predictions(
                     voting_model_set.validation_predictions,
@@ -261,6 +278,7 @@ def run_pipeline(
                         "train",
                     )
 
+                # Evaluate the ensemble and save its metrics
                 thresholds_used, metrics_map, thresholds_path = _evaluate_and_record(
                     voting_model_set,
                     config,
@@ -693,7 +711,20 @@ def _resolve_join_keys(df: DataFrame) -> List[str]:
 def _append_majority_vote_columns(
     df: DataFrame, label_cols: Iterable[str], model_types: Iterable[str]
 ) -> DataFrame:
-    """Append majority vote predictions for each label."""
+    """Append majority vote predictions for each label.
+
+    For each emotion label:
+    1. Collect predictions from all base models
+    2. Average their scores (vote share)
+    3. Predict positive if vote_share >= 0.5 (majority agrees)
+
+    Example for 'joy' with 3 models:
+    - LR predicts joy: prob=0.8
+    - SVM predicts joy: raw margin=0.6 (normalized)
+    - NB predicts joy: prob=0.7
+    - vote_share = (0.8 + 0.6 + 0.7) / 3 = 0.7
+    - Since 0.7 >= 0.5, ensemble predicts joy=1
+    """
 
     result = df
     model_list = [name for name in model_types if name]
@@ -702,26 +733,37 @@ def _append_majority_vote_columns(
 
     for label in label_cols:
         vote_inputs = []
+
+        # Collect numeric scores from each base model
+        # Prefer probabilities, fall back to raw predictions
         for model_type in model_list:
             prob_col = f"prob_{model_type}_{label}"
             pred_col = f"pred_{model_type}_{label}"
+
             if prob_col in result.columns:
+                # Use probability score (best indicator of confidence)
                 vote_inputs.append(_extract_numeric_column(result, prob_col))
             elif pred_col in result.columns:
+                # Fall back to binary prediction (0 or 1)
                 vote_inputs.append(F.col(pred_col).cast("double"))
 
         if not vote_inputs:
-            continue
+            continue  # No predictions available for this label
 
+        # Calculate vote share: average of all model scores
+        # This represents the "proportion of models agreeing"
         sum_expr = reduce(lambda acc, col: acc + col, vote_inputs[1:], vote_inputs[0])
         average_expr = sum_expr / float(len(vote_inputs))
 
+        # Store the probability-like vote share
         result = result.withColumn(
             f"prob_majority_vote_{label}", average_expr.cast("double")
         )
         result = result.withColumn(
             f"vote_share_majority_vote_{label}", average_expr.cast("double")
         )
+
+        # Make binary decision: positive if majority (>=50%) of models agree
         result = result.withColumn(
             f"pred_majority_vote_{label}",
             F.when(average_expr >= 0.5, F.lit(1.0)).otherwise(F.lit(0.0)),

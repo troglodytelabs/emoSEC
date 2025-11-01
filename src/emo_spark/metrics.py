@@ -109,58 +109,107 @@ def compute_multilabel_metrics(
     label_cols = list(label_cols)
     prediction_cols = [f"pred_{label}" for label in label_cols]
 
+    # ========================================================
+    # HAMMING LOSS: Average per-label error rate
+    # ========================================================
+    # Measures the fraction of labels that are incorrectly predicted
+    # Example: If 2 out of 8 labels are wrong, hamming loss = 2/8 = 0.25
+    # Lower is better (0 = perfect)
     diff_sum = None
     for label, pred in zip(label_cols, prediction_cols):
+        # abs(true - pred) = 1 if mismatch, 0 if match
         diff = F.abs(F.col(label) - F.col(pred))
         diff_sum = diff if diff_sum is None else diff_sum + diff
 
+    # Average the error count across all labels (row-wise)
     row_hamming = (diff_sum / float(len(label_cols))).alias("row_hamming")
+    # Then average across all examples (dataset-wise)
     hamming_loss = (
         df.select(row_hamming).agg(F.avg("row_hamming").alias("hamming")).first()[0]
     )
 
+    # ========================================================
+    # SUBSET ACCURACY: Exact match rate
+    # ========================================================
+    # Percentage of examples where ALL labels are predicted correctly
+    # Very strict metric - even one wrong label counts as failure
+    # Example: True=[1,0,1], Pred=[1,0,1] → match=1
+    #          True=[1,0,1], Pred=[1,1,1] → match=0 (one error)
     match_product = None
     for label, pred in zip(label_cols, prediction_cols):
+        # Check if this specific label matches (1.0 = match, 0.0 = mismatch)
         match = F.when(F.col(label) == F.col(pred), F.lit(1.0)).otherwise(F.lit(0.0))
+        # Multiply all matches together (product = 1 only if ALL match)
         match_product = match if match_product is None else match_product * match
+
+    # Average the product across all examples
+    # This gives the proportion of perfectly predicted examples
     subset_accuracy = (
         df.select(match_product.alias("subset_match"))
         .agg(F.avg("subset_match"))
         .first()[0]
     )
 
+    # ========================================================
+    # CONFUSION MATRIX COMPONENTS (TP, FP, FN, Support)
+    # ========================================================
+    # Compute these for each label to calculate precision/recall/F1
+    # TP (True Positive): Predicted=1, Actual=1 (correctly detected)
+    # FP (False Positive): Predicted=1, Actual=0 (false alarm)
+    # FN (False Negative): Predicted=0, Actual=1 (missed detection)
+    # Support: Total actual positive examples for this label
     agg_exprs = []
     for label, pred in zip(label_cols, prediction_cols):
         agg_exprs.extend(
             [
+                # Count true positives: model said yes AND label is yes
                 F.sum(
                     F.when((F.col(label) == 1.0) & (F.col(pred) == 1.0), 1).otherwise(0)
                 ).alias(f"{label}_tp"),
+                # Count false positives: model said yes BUT label is no
                 F.sum(
                     F.when((F.col(label) == 0.0) & (F.col(pred) == 1.0), 1).otherwise(0)
                 ).alias(f"{label}_fp"),
+                # Count false negatives: model said no BUT label is yes
                 F.sum(
                     F.when((F.col(label) == 1.0) & (F.col(pred) == 0.0), 1).otherwise(0)
                 ).alias(f"{label}_fn"),
+                # Count total actual positives (ground truth)
                 F.sum(F.when(F.col(label) == 1.0, 1).otherwise(0)).alias(
                     f"{label}_support"
                 ),
             ]
         )
 
+    # Execute all aggregations in a single pass for efficiency
     agg_row = df.agg(*agg_exprs).collect()[0].asDict()
 
+    # ========================================================
+    # PER-LABEL METRICS: Precision, Recall, F1, Support
+    # ========================================================
     per_label: List[LabelMetrics] = []
     micro_tp = micro_fp = micro_fn = 0.0
 
     for label in label_cols:
+        # Extract confusion matrix values for this label
         tp = float(agg_row.get(f"{label}_tp", 0.0))
         fp = float(agg_row.get(f"{label}_fp", 0.0))
         fn = float(agg_row.get(f"{label}_fn", 0.0))
         support = int(agg_row.get(f"{label}_support", 0))
 
+        # Precision: Of all examples we predicted positive, how many were correct?
+        # precision = TP / (TP + FP) = correct positives / all predicted positives
+        # High precision = low false alarm rate
         precision = _safe_divide(tp, tp + fp)
+
+        # Recall: Of all actual positive examples, how many did we detect?
+        # recall = TP / (TP + FN) = detected positives / all actual positives
+        # High recall = low miss rate
         recall = _safe_divide(tp, tp + fn)
+
+        # F1: Harmonic mean of precision and recall
+        # f1 = 2 × (precision × recall) / (precision + recall)
+        # Balances precision and recall into a single score
         f1 = (
             _safe_divide(2 * precision * recall, precision + recall)
             if (precision + recall)
@@ -173,10 +222,17 @@ def compute_multilabel_metrics(
             )
         )
 
+        # Accumulate for micro-averaging (global counts across all labels)
         micro_tp += tp
         micro_fp += fp
         micro_fn += fn
 
+    # ========================================================
+    # MICRO-AVERAGING: Global metrics treating all labels equally
+    # ========================================================
+    # Pool all (label, prediction) pairs and compute metrics globally
+    # This gives more weight to common labels (e.g., joy appears more than trust)
+    # Good for overall system performance assessment
     micro_precision = _safe_divide(micro_tp, micro_tp + micro_fp)
     micro_recall = _safe_divide(micro_tp, micro_tp + micro_fn)
     micro_f1 = (
@@ -185,6 +241,12 @@ def compute_multilabel_metrics(
         else 0.0
     )
 
+    # ========================================================
+    # MACRO-AVERAGING: Mean of per-label metrics
+    # ========================================================
+    # Compute metric for each label independently, then average
+    # Treats all labels equally regardless of frequency
+    # Good for assessing performance on rare labels (e.g., trust, surprise)
     macro_precision = sum(metric.precision for metric in per_label) / len(per_label)
     macro_recall = sum(metric.recall for metric in per_label) / len(per_label)
     macro_f1 = sum(metric.f1 for metric in per_label) / len(per_label)

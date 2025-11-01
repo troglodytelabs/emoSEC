@@ -111,43 +111,63 @@ class LexiconFeatureTransformer(
             """
             token_count = len(tokens) if tokens else 0
             # Initialize emotion counters for 10 NRC emotions
+            # Tracks how many words in the text are associated with each emotion
             counts = {emotion: 0 for emotion in NRC_EMOTIONS}
             total_matches = 0
 
             # Count emotion associations for each token in the document
+            # Example: "happy" might map to {joy: 1, positive: 1}
             for token in tokens or []:
+                # Look up token in broadcasted lexicon (case-insensitive)
                 entry = broadcast.value.get(token.lower())
                 if not entry:
                     continue  # Token not in lexicon, skip
+
+                # Increment total count (this token was found in lexicon)
                 total_matches += 1
-                # A token can be associated with multiple emotions
+
+                # A single token can be associated with multiple emotions
+                # Example: "happy" → both 'joy' and 'positive'
                 for emotion in entry:
                     if emotion in counts:
                         counts[emotion] += 1
 
             # Avoid division by zero for empty documents
+            # Use 1.0 as denominator to avoid undefined ratios
             denominator = float(token_count) if token_count else 1.0
             data: List[float] = []
 
             # Features 1-10: Raw counts per emotion
+            # Example: anger_count = 3 means 3 words associated with anger
             for emotion in NRC_EMOTIONS:
                 data.append(float(counts.get(emotion, 0)))
 
             # Features 11-20: Ratio of emotion words to total words
+            # Example: anger_ratio = 0.15 means 15% of words are anger-related
+            # This normalizes for document length
             for emotion in NRC_EMOTIONS:
                 data.append(float(counts.get(emotion, 0)) / denominator)
 
             # Features 21-30: Binary presence/absence flags
+            # Example: has_anger = 1.0 if ANY anger words present, else 0.0
+            # Useful for sparse texts or binary classifiers
             for emotion in NRC_EMOTIONS:
                 data.append(1.0 if counts.get(emotion, 0) > 0 else 0.0)
 
-            # Feature 31: Total lexicon matches
+            # Feature 31: Total lexicon matches (how many words found in lexicon)
+            # Higher value = more emotion-rich vocabulary
             data.append(float(total_matches))
+
             # Feature 32: Lexicon coverage (proportion of tokens in lexicon)
+            # Example: 0.5 means half the words have emotion associations
+            # Indicates how "emotional" the text's vocabulary is
             data.append(float(total_matches) / denominator)
 
             # Feature 33: Dominant emotion index (which emotion is most frequent)
+            # Returns integer 0-9 representing position in NRC_EMOTIONS list
+            # -1 if no emotions found (neutral text)
             if total_matches:
+                # Find the emotion with maximum count
                 dominant = max(NRC_EMOTIONS, key=lambda e: counts.get(e, 0))
                 data.append(float(NRC_EMOTIONS.index(dominant)))
             else:
@@ -280,32 +300,62 @@ class LinguisticFeatureTransformer(
         def compute_features(text: str, tokens: Sequence[str]) -> Vector:
             text = text or ""
             tokens = tokens or []
+
+            # Basic length statistics
+            # Word count: number of meaningful tokens (after stopword removal)
             word_count = float(len(tokens))
+            # Character count: total length including spaces and punctuation
             char_count = float(len(text))
+            # Average word length: indicator of vocabulary complexity
+            # Longer words often indicate more formal or complex emotional expression
             avg_word_length = (
                 sum(len(tok) for tok in tokens) / word_count if word_count else 0.0
             )
+
+            # Punctuation features - indicators of emotional intensity
+            # Exclamation marks suggest excitement, joy, or anger
             exclamation_count = text.count("!")
+            # Question marks suggest confusion, curiosity, or uncertainty
             question_count = text.count("?")
+            # Multiple consecutive punctuation marks indicate VERY strong emotion
+            # Examples: "What?!", "No!!!", "Really???"
             multi_punct_count = sum(
                 1
                 for seg in text.split()
                 if any(p in seg for p in ("!!", "??", "?!", "!?"))
             )
+
+            # Capitalization features - indicators of emphasis and shouting
+            # ALL CAPS words suggest shouting or strong emphasis (anger, excitement)
+            # Example: "I am SO ANGRY" has 2 all-caps tokens
             all_caps_token_count = sum(
                 1 for tok in tokens if len(tok) > 1 and tok.isupper()
             )
+            # Title Case Ratio: proportion of words starting with capital letters
+            # Can indicate formal writing or proper nouns
             title_case_tokens = sum(1 for tok in tokens if tok.istitle())
             title_case_ratio = title_case_tokens / word_count if word_count else 0.0
+            # Uppercase character ratio: overall proportion of capital letters
+            # High ratio suggests shouting or emphasis throughout the text
             uppercase_chars = sum(1 for ch in text if ch.isupper())
             uppercase_char_ratio = uppercase_chars / char_count if char_count else 0.0
+
+            # Special character count: non-alphanumeric symbols
+            # Includes @, #, $, %, &, etc. - may indicate informal or emotional text
             special_char_count = sum(
                 1 for ch in text if not ch.isalnum() and not ch.isspace()
             )
+
+            # Punctuation density: punctuation marks per word
+            # Higher density suggests more fragmented, emotional writing
             punctuation_total = exclamation_count + question_count
             punctuation_density = punctuation_total / word_count if word_count else 0.0
+
+            # Digit count: number of numeric characters
+            # May correlate with specific contexts (dates, quantities, etc.)
             digit_count = sum(1 for ch in text if ch.isdigit())
 
+            # Assemble all 12 linguistic features into a vector
             values = [
                 word_count,
                 char_count,
@@ -425,43 +475,81 @@ class VADFeatureTransformer(
 
         def compute(tokens: Sequence[str]) -> Vector:
             tokens = tokens or []
+
+            # Look up VAD scores for each token in the broadcasted lexicon
+            # Only include tokens that exist in the VAD lexicon
+            # Each match is a tuple: (valence, arousal, dominance)
             matches = [
                 broadcast.value[token.lower()]
                 for token in tokens
                 if token and token.lower() in broadcast.value
             ]
+
+            # Calculate coverage: proportion of tokens with VAD scores
+            # Higher coverage means more of the text has affective information
             total_tokens = float(len(tokens)) if tokens else 0.0
             coverage = len(matches) / total_tokens if total_tokens else 0.0
 
             def stats(index: int) -> Tuple[float, float, float]:
+                """Calculate mean, std, and range for a VAD dimension.
+
+                Args:
+                    index: 0 for valence, 1 for arousal, 2 for dominance
+
+                Returns:
+                    Tuple of (mean, standard_deviation, range)
+
+                Example:
+                    For valence scores [0.8, 0.9, 0.7]:
+                    - mean = 0.8 (positive emotion)
+                    - std = 0.082 (low variability, consistent positivity)
+                    - range = 0.2 (max - min)
+                """
                 if not matches:
                     return 0.0, 0.0, 0.0
+
+                # Extract values for this dimension from all matched tokens
                 values = [triple[index] for triple in matches]
+
+                # Mean: average affective score for this dimension
                 mean = sum(values) / len(values)
+
+                # Standard deviation: measures emotional consistency
+                # Low std = consistent emotion (e.g., all positive)
+                # High std = mixed emotions (e.g., both happy and sad words)
                 if len(values) > 1:
                     variance = sum((val - mean) ** 2 for val in values) / (
                         len(values) - 1
                     )
                 else:
                     variance = 0.0
+
+                # Range: difference between most extreme values
+                # Indicates emotional contrast in the text
                 spread = max(values) - min(values)
+
                 return mean, variance**0.5, spread
 
+            # Calculate statistics for each of the 3 VAD dimensions
+            # Valence: pleasure/positivity (0=negative, 1=positive)
             valence = stats(0)
+            # Arousal: activation/energy (0=calm, 1=excited)
             arousal = stats(1)
+            # Dominance: control/power (0=submissive, 1=dominant)
             dominance = stats(2)
 
+            # Assemble 10 features: 3 stats × 3 dimensions + 1 coverage
             values = [
-                valence[0],
-                valence[1],
-                valence[2],
-                arousal[0],
-                arousal[1],
-                arousal[2],
-                dominance[0],
-                dominance[1],
-                dominance[2],
-                coverage,
+                valence[0],  # valence_mean
+                valence[1],  # valence_std
+                valence[2],  # valence_range
+                arousal[0],  # arousal_mean
+                arousal[1],  # arousal_std
+                arousal[2],  # arousal_range
+                dominance[0],  # dominance_mean
+                dominance[1],  # dominance_std
+                dominance[2],  # dominance_range
+                coverage,  # proportion of tokens with VAD scores
             ]
             return Vectors.dense(values)
 

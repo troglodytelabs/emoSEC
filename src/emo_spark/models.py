@@ -121,19 +121,28 @@ class ModelTrainer:
         """
 
         model_type = "logistic_regression"
+        # Cache training data in memory for faster access during iterative training
+        # Since we train 8 separate models, caching avoids re-reading data 8 times
         cached_train = train_df.cache()
 
         models: Dict[str, LogisticRegressionModel] = {}
         summaries: Dict[str, Dict[str, float]] = {}
         total_labels = len(self.label_cols)
 
+        # Train one binary classifier per emotion (one-vs-rest strategy)
+        # Example: joy classifier treats joy=1 as positive, all others as negative
         for index, label in enumerate(self.label_cols, start=1):
             logger.info(
                 "[LR] Fitting classifier for '%s' (%d/%d)", label, index, total_labels
             )
+
+            # Configure logistic regression with L2 regularization
+            # regParam: controls strength of regularization (prevents overfitting)
+            # elasticNetParam: 0.0 = pure L2 (ridge), 1.0 = pure L1 (lasso)
+            # maxIter: maximum number of optimization iterations
             estimator = LogisticRegression(
                 featuresCol="features",
-                labelCol=label,
+                labelCol=label,  # Train on this specific emotion label
                 predictionCol=self._col_name(model_type, label, "pred"),
                 probabilityCol=self._col_name(model_type, label, "prob"),
                 rawPredictionCol=self._col_name(model_type, label, "raw"),
@@ -142,20 +151,28 @@ class ModelTrainer:
                 maxIter=self.config.lr_max_iter,
             )
 
+            # Fit the model on training data
+            # Uses L-BFGS optimizer under the hood (quasi-Newton method)
             model = estimator.fit(cached_train)
             models[label] = model
+
+            # Store hyperparameters for reproducibility and documentation
             summaries[label] = {
                 "regParam": float(model.getRegParam()),
                 "elasticNetParam": float(model.getElasticNetParam()),
                 "maxIter": float(model.getMaxIter()),
             }
+
+            # Try to extract training objective (final loss value)
+            # This helps diagnose convergence issues
             try:
                 training_summary = model.summary
                 objective_history = getattr(training_summary, "objectiveHistory", [])
                 if objective_history:
+                    # Last value in objective history is final training loss
                     summaries[label]["objective"] = float(objective_history[-1])
             except AttributeError:
-                pass
+                pass  # Some Spark versions don't expose summary
 
             logger.info(
                 "[LR] Completed '%s' (reg=%.4g, elastic=%.2f, maxIter=%d)",
@@ -165,17 +182,24 @@ class ModelTrainer:
                 int(model.getMaxIter()),
             )
 
+        # Generate predictions on training data if requested
+        # Useful for analyzing overfitting and training metrics
         train_predictions = (
             self._apply_models(cached_train, models)
             if generate_train_predictions
             else None
         )
 
+        # Clean up cached data to free memory
         cached_train.unpersist()
 
+        # Generate predictions on validation and test sets
+        # These are used for evaluation and threshold tuning
         val_predictions = self._apply_models(val_df, models)
         test_predictions = self._apply_models(test_df, models)
 
+        # Package everything into a ModelSet container
+        # This encapsulates models, predictions, and metadata
         return ModelSet(
             model_type=model_type,
             models=models,
@@ -289,6 +313,9 @@ class ModelTrainer:
         """
         model_type = "naive_bayes"
 
+        # Naive Bayes requires NON-NEGATIVE features (counts or probabilities)
+        # Our TF-IDF features can have small negative values due to floating point
+        # Clip all negative values to 0 to satisfy the algorithm's assumptions
         train_nb = train_df.withColumn(
             "_nb_features", _CLIP_TO_NON_NEGATIVE_UDF(F.col("features"))
         ).cache()
@@ -307,13 +334,18 @@ class ModelTrainer:
             logger.info(
                 "[NB] Training classifier for '%s' (%d/%d)", label, index, total_labels
             )
+
+            # Multinomial Naive Bayes: treats features as counts/frequencies
+            # Assumes features are conditionally independent given the class
+            # Fast training and prediction, good baseline for text classification
+            # smoothing parameter (Laplace smoothing) prevents zero probabilities
             estimator = NaiveBayes(
-                featuresCol="_nb_features",
+                featuresCol="_nb_features",  # Use clipped non-negative features
                 labelCol=label,
                 predictionCol=self._col_name(model_type, label, "pred"),
                 probabilityCol=self._col_name(model_type, label, "prob"),
                 rawPredictionCol=self._col_name(model_type, label, "raw"),
-                modelType="multinomial",
+                modelType="multinomial",  # Appropriate for count-based features
             )
             model = estimator.fit(train_nb)
             models[label] = model
@@ -324,6 +356,7 @@ class ModelTrainer:
                 float(model.getSmoothing()),
             )
 
+        # Generate predictions and drop the temporary _nb_features column
         train_predictions = (
             self._drop_column(self._apply_models(train_nb, models), "_nb_features")
             if generate_train_predictions
@@ -332,6 +365,7 @@ class ModelTrainer:
 
         train_nb.unpersist()
 
+        # Apply models to validation and test sets, cleaning up temporary column
         val_predictions = self._drop_column(
             self._apply_models(val_nb, models), "_nb_features"
         )
