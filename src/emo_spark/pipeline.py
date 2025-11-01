@@ -108,6 +108,8 @@ def run_pipeline(
         if feature_stage.resumed:
             logger.info("Resumed feature datasets from previous run")
 
+        logger.info("Features schema: %s", train_features.schema.simpleString())
+
         # ============================================================
         # STEP 5: MODEL TRAINING (ONE-VS-REST STRATEGY)
         # ============================================================

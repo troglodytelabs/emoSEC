@@ -132,15 +132,5 @@ TARGET_LABELS: List[str] = PLUTCHIK_EMOTIONS
 
 # Column name constants
 DEFAULT_TEXT_COL = "text"  # Raw input text column
-PROCESSED_TEXT_COL = "clean_text"  # Cleaned/preprocessed text
 TOKEN_COL = "tokens"  # Tokenized text
 STOPWORD_FREE_COL = "filtered_tokens"  # Tokens after stopword removal
-FEATURES_COL = "features"  # Assembled feature vector
-
-# Prediction column prefixes
-PREDICTION_PREFIX = "pred_"  # Binary predictions
-PROBABILITY_PREFIX = "prob_"  # Probability distributions
-RAW_PREDICTION_PREFIX = "raw_pred_"  # Raw model scores
-
-# Supported model types
-MODEL_TYPES = ["logistic_regression", "linear_svm", "naive_bayes", "random_forest"]

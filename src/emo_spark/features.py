@@ -688,7 +688,7 @@ class FeatureBuilder:
         self.vector_columns = vector_columns
         return Pipeline(stages=stages)
 
-    def fit(self, df: DataFrame) -> "FeatureBuilder":
+    def fit(self, df: DataFrame) -> FeatureBuilder:
         """Fit the feature pipeline on training data.
 
         Args:

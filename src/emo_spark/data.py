@@ -84,7 +84,7 @@ def load_goemotions(
         Unified DataFrame with 'text' column and Plutchik emotion labels.
     """
 
-    frames = []
+    frames: list[DataFrame] = []
     for path in paths:
         frames.append(
             spark.read.option("header", True)
@@ -397,21 +397,15 @@ def aggregate_rater_annotations(df: DataFrame) -> DataFrame:
     labels using max(), producing one row per unique text.
 
     Args:
-        df: DataFrame with potentially duplicate texts from multiple raters.
+        df: DataFrame with multiple annotations from multiple raters.
 
     Returns:
         Deduplicated DataFrame with aggregated labels.
     """
 
-    group_cols = ["text"]
-    if "id" in df.columns:
-        group_cols.insert(0, "id")
-
+    group_cols = ["id", "text"]
     aggregations = [F.max(F.col(label)).alias(label) for label in GOEMOTIONS_LABELS]
-
     aggregated = df.groupBy(*group_cols).agg(*aggregations)
-
-    if "id" in aggregated.columns:
-        aggregated = aggregated.drop("id")
+    aggregated = aggregated.drop("id")
 
     return aggregated

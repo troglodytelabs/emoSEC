@@ -24,6 +24,200 @@ Scalable multi-label emotion classification on the GoEmotions corpus using Apach
 - **Interactive storytelling demo** (`python -m emo_spark.demo`) that loads trained artifacts, respects per-emotion probability thresholds, and narrates emotional storylines for custom text.
 - **Cloud friendly**: all I/O paths resolve for local storage and S3 buckets, toggled via environment variables.
 
+## Data Assets
+
+- **GoEmotions**: 58k+ English Reddit comments annotated with 27 fine-grained emotion labels plus neutrality. The raw CSVs are split into three shards (`data/goemotions_1.csv` through `_3.csv`).
+- **Plutchik projection**: Raw labels are projected onto Plutchik’s eight primary emotions (`joy`, `trust`, `fear`, `surprise`, `sadness`, `disgust`, `anger`, `anticipation`) using the mappings in `src/emo_spark/constants.py` (`project_to_plutchik`).
+- **NRC Emotion Lexicon**: Word-level associations between tokens and 10 discrete emotions. Used to derive count ratios, binary flags, and coverage diagnostics in `LexiconFeatureTransformer`.
+- **NRC VAD Lexicon**: Continuous valence–arousal–dominance scores per token. Summaries feed `VADFeatureTransformer`.
+- **Stratified splits**: During ingestion we stratify train/validation/test on the dominant Plutchik label to keep rare classes (e.g., `trust`, `surprise`) represented.
+
+## Environment Setup
+
+1. **Create a virtual environment and install dependencies**
+
+   ```bash
+   # Option 1: Using uv (recommended for faster dependency resolution)
+   # Install uv first if not already installed:
+   # On macOS and Linux:
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   # On Windows:
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+   uv sync
+   source .venv/bin/activate  # On macOS/Linux
+   # Or: .venv\Scripts\activate  # On Windows
+
+   # Option 2: Using standard Python venv and pip
+   python3 -m venv .venv
+   source .venv/bin/activate  # On macOS/Linux
+   # Or: .venv\Scripts\activate  # On Windows
+   pip install -e .
+   ```
+
+## Data Preparation
+
+1. **Ensure the GoEmotions CSVs exist** or run the helper script:
+
+   ```bash
+   chmod +x prepare_data.sh  # Make script executable (first time only)
+   ./prepare_data.sh
+   ```
+
+   The script will check for the three GoEmotions CSV shards in the `data/` directory.
+
+2. **NRC Lexicons**: The script also verifies the presence of the NRC lexica. If they are missing, you'll need to download them manually from the official sources and place them at:
+
+   - `data/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt` - Download from: [NRC Emotion Lexicon](http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm)
+   - `data/NRC-VAD-Lexicon-v2.1.txt` - Download from: [NRC VAD Lexicon](http://saifmohammad.com/WebPages/nrc-vad.html)
+
+3. **(Optional) For AWS EMR**: Upload the entire `data/` directory to an S3 prefix for distributed runs, keeping the filenames identical. For example:
+   ```bash
+   aws s3 sync data/ s3://your-bucket/emoSpark/data/
+   ```
+
+**Note**: The loader in `src/emo_spark/data.py` automatically detects whether paths are local or S3-based on the `EMO_SPARK_INPUT_PATH` environment variable.
+
+## Configuration
+
+Environment variables control most runtime behavior. Defaults are tuned for balanced throughput and accuracy; override only what you need.
+
+| Variable                    | Purpose                                                                           | Default        |
+| --------------------------- | --------------------------------------------------------------------------------- | -------------- |
+| `EMO_SPARK_ENV`             | Execution context. Use `local` or `emr` to switch logging/storage conventions.    | `local`        |
+| `EMO_SPARK_INPUT_PATH`      | Folder (local) or S3 prefix containing GoEmotions CSVs and NRC lexica.            | `data`         |
+| `EMO_SPARK_OUTPUT_PATH`     | Output folder or S3 prefix for features, models, metrics, and demos.              | `output`       |
+| `EMO_SPARK_SAMPLE_FRACTION` | Optional float (0–1) to subsample before splitting. Handy for laptop experiments. | unset          |
+| `EMO_SPARK_SEED`            | Seed used for sampling, splitting, and Spark randomness.                          | `42`           |
+| `EMO_SPARK_CACHE`           | `1` to persist intermediate DataFrames, `0` to disable caching.                   | `1`            |
+| `EMO_SPARK_THRESHOLDS`      | JSON string or `label=value` pairs overriding Plutchik probability thresholds.    | tuned defaults |
+| `EMO_SPARK_REPARTITION`     | Target partition count for feature tables; improves shuffle balance.              | unset          |
+
+Refer to `src/emo_spark/config.py` for the exhaustive list, including advanced knobs for n-gram ranges, vocab sizes, regularization grids, and I/O shuffles.
+
+## Running Locally
+
+1. **Activate the environment** and export any configuration overrides:
+
+   ```bash
+   source .venv/bin/activate  # On macOS/Linux
+   # Or: .venv\Scripts\activate  # On Windows
+
+   # Optional: Sample a smaller fraction for faster iteration during development
+   export EMO_SPARK_SAMPLE_FRACTION=0.2
+   export EMO_SPARK_OUTPUT_PATH=output
+   ```
+
+2. **Launch training**. Select one or more base models (comma-separated). When two or more families are trained, the pipeline automatically derives a majority-vote ensemble across their predictions:
+
+   ```bash
+   # Train all models (recommended for best performance)
+   python -m emo_spark.main
+
+   # Or train just one model for quick testing
+   python -m emo_spark.main \
+     --models logistic_regression
+   ```
+
+3. **Outputs** are written to the configured output path:
+
+   - `output/features/{train,validation,test}/` – Engineered features in Parquet format, ready for reuse.
+   - `output/models/feature_pipeline/` – Fitted `PipelineModel` capturing tokenization, TF-IDF, and lexicon transforms.
+   - `output/models/<model_type>/<emotion>/` – Per-label Spark MLlib models for each algorithm.
+   - `output/predictions/<model_type>/<split>/` – Scored predictions with probability columns when available.
+   - `output/predictions/majority_vote/<split>/` – Ensemble predictions produced when multiple families are trained.
+   - `output/evaluation/metrics_<model_type>.json` – Micro/macro F1, Hamming loss, subset accuracy, and per-emotion metrics (includes `metrics_majority_vote.json` when the ensemble is produced).
+   - `output/evaluation/thresholds/thresholds_<model_type>.json` – Auto-tuned probability thresholds per emotion.
+   - `output/holdout/test_set/` – Untouched holdout split for future comparisons and demos.
+   - `output/demo/demo_samples.json` – Sample texts from test set for interactive demonstration.
+
+4. **Speed up exploratory runs**: Reduce the model set (`--models logistic_regression`) and use sampling (`EMO_SPARK_SAMPLE_FRACTION=0.1`). Restore full data before producing final results.
+
+## Running on AWS EMR
+
+1. **Provision infrastructure**
+
+   - Create an S3 bucket (or reuse one) and upload the entire `data/` directory plus any configuration files:
+     ```bash
+     aws s3 sync data/ s3://your-bucket/data/
+     ```
+   - Launch an EMR cluster.
+
+2. **Bootstrap dependencies**
+
+   - Either `git clone` this repository on the master node or stage a tarball to S3 and extract.
+   - On the master node, run `pip install -e .` inside a Python 3.10+ environment (EMR’s default) or create a virtual environment mirroring the local setup.
+   - Set `PYSPARK_PYTHON` and `PYSPARK_DRIVER_PYTHON` to the interpreter that has the project installed if you deviate from the system Python.
+
+3. **Configure environment variables** (per session or via `spark-submit --conf spark.yarn.appMasterEnv...`):
+
+   ```bash
+   export EMO_SPARK_ENV=emr
+   export EMO_SPARK_INPUT_PATH=s3://<bucket>/data
+   export EMO_SPARK_OUTPUT_PATH=s3://<bucket>/output
+   ```
+
+4. **Submit the job**
+
+   - **Option A (spark-submit)** – recommended for YARN-managed runs:
+
+     ```bash
+     spark-submit \
+       --master yarn \
+       --deploy-mode cluster \
+       --conf spark.executor.instances=8 \
+       --conf spark.executor.memory=6g \
+       --conf spark.executor.cores=2 \
+       src/emo_spark/main.py \
+       --models logistic_regression --verbose
+     ```
+
+     Supply additional `--conf` flags for shuffle tuning (`spark.sql.shuffle.partitions`, etc.) as needed.
+
+   - **Option B (python -m)** – quick interactive runs from the master node shell:
+
+     ```bash
+     python -m emo_spark.main --models logistic_regression --verbose
+     ```
+
+5. **Result collection**
+   - Metrics, predictions, and persisted models land under the configured S3 output prefix.
+   - EMR step logs (stdout/stderr) provide progress and per-stage summaries.
+
+## Interactive Demo
+
+After training, launch the storytelling demo to inspect predictions interactively. The majority-vote ensemble provides the strongest scores when multiple base models are available, but you can still target individual model families:
+
+```bash
+python -m emo_spark.demo \
+  --use-demo-samples \
+  --text "Wow this is amazing. LOVE THIS!!!"
+```
+
+Add custom examples using repeated `--text "Some input"` arguments. The demo reports threshold-aware predictions, probability scores where available, and narrates the leading emotional storyline.
+
+If your training run produced only a single family, specify it explicitly (for example `--model logistic_regression`) so the demo can load the correct artifacts.
+
+## Repository Layout
+
+```
+data/                     # GoEmotions CSVs and NRC emotion/VAD lexica
+docs/                     # Architecture notes, diagrams, and research context
+output/                   # Generated artifacts (features, models, metrics)
+src/emo_spark/            # PySpark source code
+  config.py               # Runtime configuration dataclass and defaults
+  data.py                 # Data loading, projection, and stratified splitting
+  features.py             # Feature engineering pipeline components
+  models.py               # Model orchestration and cross-validation logic
+  metrics.py              # Multi-label metric computations and utilities
+  evaluation.py           # Evaluation manager for metrics + persistence
+  pipeline.py             # End-to-end pipeline wiring helpers
+  main.py                 # CLI entrypoint for training
+  demo.py                 # Interactive demo CLI
+```
+
+---
+
 ## Data Flow and Model Training Pipeline
 
 This section provides a detailed, step-by-step explanation of how raw text data flows through the emoSpark pipeline to produce trained emotion classification models.
@@ -810,231 +1004,3 @@ F1 = 2 × (P×R)/(P+R) = 0.83
 - **Plutchik's Wheel**: Plutchik (1980) - 8 primary emotions framework
 - **NRC Emotion Lexicon**: Mohammad & Turney (2013) - Word-emotion associations
 - **NRC VAD Lexicon**: Mohammad (2018) - Valence-arousal-dominance norms
-
----
-
-## Data Assets
-
-- **GoEmotions**: 58k+ English Reddit comments annotated with 27 fine-grained emotion labels plus neutrality. The raw CSVs are split into three shards (`data/goemotions_1.csv` through `_3.csv`).
-- **Plutchik projection**: Raw labels are projected onto Plutchik’s eight primary emotions (`joy`, `trust`, `fear`, `surprise`, `sadness`, `disgust`, `anger`, `anticipation`) using the mappings in `src/emo_spark/constants.py` (`project_to_plutchik`).
-- **NRC Emotion Lexicon**: Word-level associations between tokens and 10 discrete emotions. Used to derive count ratios, binary flags, and coverage diagnostics in `LexiconFeatureTransformer`.
-- **NRC VAD Lexicon**: Continuous valence–arousal–dominance scores per token. Summaries feed `VADFeatureTransformer`.
-- **Stratified splits**: During ingestion we stratify train/validation/test on the dominant Plutchik label to keep rare classes (e.g., `trust`, `surprise`) represented.
-
-## Environment Setup
-
-**Requirements**: Python 3.13 or higher
-
-1. **Create a virtual environment and install dependencies**
-
-   ```bash
-   # Option 1: Using uv (recommended for faster dependency resolution)
-   # Install uv first if not already installed:
-   # On macOS and Linux:
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   # On Windows:
-   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-   uv sync
-   source .venv/bin/activate  # On macOS/Linux
-   # Or: .venv\Scripts\activate  # On Windows
-
-   # Option 2: Using standard Python venv and pip
-   python3.13 -m venv .venv
-   source .venv/bin/activate  # On macOS/Linux
-   # Or: .venv\Scripts\activate  # On Windows
-   pip install -e .
-   ```
-
-## Data Preparation
-
-1. **Ensure the GoEmotions CSVs exist** or run the helper script:
-
-   ```bash
-   chmod +x prepare_data.sh  # Make script executable (first time only)
-   ./prepare_data.sh
-   ```
-
-   The script will check for the three GoEmotions CSV shards in the `data/` directory.
-
-2. **NRC Lexicons**: The script also verifies the presence of the NRC lexica. If they are missing, you'll need to download them manually from the official sources and place them at:
-
-   - `data/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt` - Download from: [NRC Emotion Lexicon](http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm)
-   - `data/NRC-VAD-Lexicon-v2.1.txt` - Download from: [NRC VAD Lexicon](http://saifmohammad.com/WebPages/nrc-vad.html)
-
-3. **(Optional) For AWS EMR**: Upload the entire `data/` directory to an S3 prefix for distributed runs, keeping the filenames identical. For example:
-   ```bash
-   aws s3 sync data/ s3://your-bucket/emoSpark/data/
-   ```
-
-**Note**: The loader in `src/emo_spark/data.py` automatically detects whether paths are local or S3-based on the `EMO_SPARK_INPUT_PATH` environment variable.
-
-## Configuration
-
-Environment variables control most runtime behaviour. Defaults are tuned for balanced throughput and accuracy; override only what you need.
-
-| Variable                    | Purpose                                                                           | Default        |
-| --------------------------- | --------------------------------------------------------------------------------- | -------------- |
-| `EMO_SPARK_ENV`             | Execution context. Use `local` or `emr` to switch logging/storage conventions.    | `local`        |
-| `EMO_SPARK_INPUT_PATH`      | Folder (local) or S3 prefix containing GoEmotions CSVs and NRC lexica.            | `data`         |
-| `EMO_SPARK_OUTPUT_PATH`     | Output folder or S3 prefix for features, models, metrics, and demos.              | `output`       |
-| `EMO_SPARK_SAMPLE_FRACTION` | Optional float (0–1) to subsample before splitting. Handy for laptop experiments. | unset          |
-| `EMO_SPARK_SEED`            | Seed used for sampling, splitting, and Spark randomness.                          | `42`           |
-| `EMO_SPARK_CACHE`           | `1` to persist intermediate DataFrames, `0` to disable caching.                   | `1`            |
-| `EMO_SPARK_THRESHOLDS`      | JSON string or `label=value` pairs overriding Plutchik probability thresholds.    | tuned defaults |
-| `EMO_SPARK_REPARTITION`     | Target partition count for feature tables; improves shuffle balance.              | unset          |
-
-Refer to `src/emo_spark/config.py` for the exhaustive list, including advanced knobs for n-gram ranges, vocab sizes, regularization grids, and I/O shuffles.
-
-## Running Locally
-
-1. **Activate the environment** and export any configuration overrides:
-
-   ```bash
-   source .venv/bin/activate  # On macOS/Linux
-   # Or: .venv\Scripts\activate  # On Windows
-
-   # Optional: Sample a smaller fraction for faster iteration during development
-   export EMO_SPARK_SAMPLE_FRACTION=0.2
-   export EMO_SPARK_OUTPUT_PATH=output
-   ```
-
-2. **Launch training**. Select one or more base models (comma-separated). When two or more families are trained, the pipeline automatically derives a majority-vote ensemble across their predictions:
-
-   ```bash
-   # Train all models (recommended for best performance)
-   python -m emo_spark.main \
-     --models logistic_regression,linear_svm,naive_bayes,random_forest \
-     --verbose
-
-   # Or train just one model for quick testing
-   python -m emo_spark.main \
-     --models logistic_regression \
-     --verbose
-   ```
-
-3. **Outputs** are written to the configured output path:
-
-   - `output/features/{train,validation,test}/` – Engineered features in Parquet format, ready for reuse.
-   - `output/models/feature_pipeline/` – Fitted `PipelineModel` capturing tokenization, TF-IDF, and lexicon transforms.
-   - `output/models/<model_type>/<emotion>/` – Per-label Spark MLlib models for each algorithm.
-   - `output/predictions/<model_type>/<split>/` – Scored predictions with probability columns when available.
-   - `output/predictions/majority_vote/<split>/` – Ensemble predictions produced when multiple families are trained.
-   - `output/evaluation/metrics_<model_type>.json` – Micro/macro F1, Hamming loss, subset accuracy, and per-emotion metrics (includes `metrics_majority_vote.json` when the ensemble is produced).
-   - `output/evaluation/thresholds/thresholds_<model_type>.json` – Auto-tuned probability thresholds per emotion.
-   - `output/holdout/test_set/` – Untouched holdout split for future comparisons and demos.
-   - `output/demo/demo_samples.json` – Sample texts from test set for interactive demonstration.
-
-4. **Speed up exploratory runs**: Reduce the model set (`--models logistic_regression`) and use sampling (`EMO_SPARK_SAMPLE_FRACTION=0.1`). Restore full data before producing final results.
-
-## Running on AWS EMR
-
-1. **Provision infrastructure**
-
-   - Create an S3 bucket (or reuse one) and upload the entire `data/` directory plus any configuration files:
-     ```bash
-     aws s3 sync data/ s3://your-bucket/emoSpark/data/
-     ```
-   - Launch an EMR cluster with Spark 3.5+ and Python 3.13+. Use at least 2-4 worker nodes (m5.xlarge or larger) for reasonable performance on the full dataset.
-
-2. **Bootstrap dependencies**
-
-   - Either `git clone` this repository on the master node or stage a tarball to S3 and extract.
-   - On the master node, run `pip install -e .` inside a Python 3.10+ environment (EMR’s default) or create a virtual environment mirroring the local setup.
-   - Set `PYSPARK_PYTHON` and `PYSPARK_DRIVER_PYTHON` to the interpreter that has the project installed if you deviate from the system Python.
-
-3. **Configure environment variables** (per session or via `spark-submit --conf spark.yarn.appMasterEnv...`):
-
-   ```bash
-   export EMO_SPARK_ENV=emr
-   export EMO_SPARK_INPUT_PATH=s3://<bucket>/data
-   export EMO_SPARK_OUTPUT_PATH=s3://<bucket>/emoSpark-output
-   ```
-
-4. **Submit the job**
-
-   - **Option A (spark-submit)** – recommended for YARN-managed runs:
-
-     ```bash
-     spark-submit \
-       --master yarn \
-       --deploy-mode cluster \
-       --conf spark.executor.instances=8 \
-       --conf spark.executor.memory=6g \
-       --conf spark.executor.cores=2 \
-       src/emo_spark/main.py \
-       --models logistic_regression --verbose
-     ```
-
-     Supply additional `--conf` flags for shuffle tuning (`spark.sql.shuffle.partitions`, etc.) as needed.
-
-   - **Option B (python -m)** – quick interactive runs from the master node shell:
-
-     ```bash
-     python -m emo_spark.main --models logistic_regression --verbose
-     ```
-
-5. **Result collection**
-   - Metrics, predictions, and persisted models land under the configured S3 output prefix.
-   - EMR step logs (stdout/stderr) provide progress and per-stage summaries.
-
-## Inspecting Results
-
-- **Metrics JSON**: Each trained model writes `output/evaluation/metrics_<model>.json`. Inspect with `jq`:
-
-  ```bash
-  jq '.[] | {dataset, micro_f1: .micro_f1, macro_f1: .macro_f1, hamming_loss: .hamming_loss}' \
-    output/evaluation/metrics_logistic_regression.json
-  ```
-
-- **Per-emotion breakdown**: The JSON entries contain nested `per_label` stats. Example of extracting the `joy` F1 score:
-
-  ```bash
-  jq '.[] | select(.dataset == "validation") | .per_label.joy.f1' \
-    output/evaluation/metrics_logistic_regression.json
-  ```
-
-- **Predictions**: View Parquet predictions in Spark SQL, pandas, or DuckDB:
-
-  ```bash
-  python - <<'PY'
-  import pandas as pd
-  df = pd.read_parquet('output/predictions/logistic_regression/validation')
-  print(df.head())
-  PY
-  ```
-
-- **Reference performance**: On the full GoEmotions training set with tuned thresholds, logistic regression typically achieves micro-F1 in the high 0.4s and macro-F1 around the low 0.4s. Exact numbers vary with sampling, CV folds, and threshold overrides; use the metrics JSON as the source of truth for your run.
-
-## Interactive Demo
-
-After training, launch the storytelling demo to inspect predictions interactively. The majority-vote ensemble provides the strongest scores when multiple base models are available, but you can still target individual model families:
-
-```bash
-python -m emo_spark.demo \
-  --model majority_vote \
-  --use-demo-samples \
-  --thresholds-json '{"joy":0.6,"fear":0.4}'
-```
-
-Add custom examples using repeated `--text "Some input"` arguments. The demo reports threshold-aware predictions, probability scores where available, and narrates the leading emotional storyline.
-
-If your training run produced only a single family, specify it explicitly (for example `--model logistic_regression`) so the demo can load the correct artifacts.
-
-## Repository Layout
-
-```
-data/                     # GoEmotions CSVs and NRC emotion/VAD lexica
-docs/                     # Architecture notes, diagrams, and research context
-output/                   # Generated artifacts (features, models, metrics)
-src/emo_spark/            # PySpark source code
-  config.py               # Runtime configuration dataclass and defaults
-  data.py                 # Data loading, projection, and stratified splitting
-  features.py             # Feature engineering pipeline components
-  models.py               # Model orchestration and cross-validation logic
-  metrics.py              # Multi-label metric computations and utilities
-  evaluation.py           # Evaluation manager for metrics + persistence
-  pipeline.py             # End-to-end pipeline wiring helpers
-  main.py                 # CLI entrypoint for training
-  demo.py                 # Interactive demo CLI
-```
