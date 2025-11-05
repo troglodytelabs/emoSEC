@@ -4,9 +4,20 @@ simple script-based implementation of multi-label emotion classification.
 
 ## quick start
 
+### using conda (recommended)
+
 ```bash
+# create conda environment with python 3.11
+conda create -n emoSpark python=3.11
+
+# activate environment
+conda activate emoSpark
+
 # install dependencies
 pip install -r requirements.txt
+
+# verify packages installed
+conda list
 
 # update lexicon paths in emotion_classification.py (lines 58-59)
 NRC_EMOTION_PATH = '/path/to/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt'
@@ -14,6 +25,42 @@ NRC_VAD_PATH = '/path/to/NRC-Emotion-Intensity-Lexicon-v1.txt'
 
 # run script
 python emotion_classification.py
+```
+
+### using venv (alternative)
+
+```bash
+# create virtual environment with python 3.11
+python3.11 -m venv venv
+
+# activate environment
+source venv/bin/activate  # mac/linux
+# or: venv\Scripts\activate  # windows
+
+# install dependencies
+pip install -r requirements.txt
+
+# run script
+python emotion_classification.py
+```
+
+### managing conda environment
+
+```bash
+# activate environment
+conda activate emoSpark
+
+# deactivate environment
+conda deactivate
+
+# list all packages in environment
+conda list
+
+# list all conda environments
+conda env list
+
+# delete environment (if needed)
+conda env remove -n emoSpark
 ```
 
 ## what it does
@@ -95,10 +142,18 @@ no nltk needed - we use simple regex for tokenization.
 
 ## requirements
 
-- python 3.8+
+- **python 3.11** (3.14 has compatibility issues with pyspark)
 - java 8+ (for spark)
 - ~2gb ram minimum
 - internet connection (first run only, to download goemotions)
+
+### recommended setup
+use conda for easy python version management:
+```bash
+conda create -n emoSpark python=3.11
+conda activate emoSpark
+pip install -r requirements.txt
+```
 
 ## expected performance
 
@@ -116,7 +171,7 @@ with default settings (50% data, threshold=0.25):
 
 ## authors
 
-devin dyson, madhur deep jain  
-met cs 777 - big data analytics  
-boston university  
+devin dyson, madhur deep jain
+met cs 777 - big data analytics
+boston university
 november 5, 2025
