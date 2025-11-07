@@ -66,7 +66,7 @@ NRC_EMOTION_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-Emotio
 NRC_VAD_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-VAD-Lexicon.txt'
 
 # model hyperparameters - adjust these to tune performance
-SAMPLE_SIZE = 0.02  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
+SAMPLE_SIZE = 0.01  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
 TRAIN_SPLIT = 0.8  # fraction for training (0.8 = 80% train, 20% test)
 TFIDF_FEATURES = 500  # number of tf-idf hash features (higher = more vocab coverage)
 NGRAM_RANGE = 3  # max n-gram size (3 = unigrams, bigrams, trigrams)
