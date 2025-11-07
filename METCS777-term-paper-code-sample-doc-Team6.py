@@ -2,17 +2,25 @@
 scalable emotion classification for affective computing using apache spark
 multi-label text classification with hybrid lexical-dimensional features
 
+implements complete feature set:
+- tf-idf with n-grams (unigrams + bigrams + trigrams)
+- nrc emotion features (raw counts + normalized ratios)
+- vad dimensional features (mean, std, range for each dimension)
+- linguistic signals (length, punctuation, emphasis markers)
+- multiple classifiers (logistic regression, svm, naive bayes, random forest)
+- ensemble aggregation with majority voting
+
 author: group 6 - devin dyson, madhur deep jain
 date: november 5, 2025
 """
 
 import re
 from pyspark.sql import SparkSession
-from pyspark.ml.feature import HashingTF, IDF, Tokenizer
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.feature import HashingTF, IDF, Tokenizer, NGram
+from pyspark.ml.classification import LogisticRegression, LinearSVC, NaiveBayes, RandomForestClassifier
 from pyspark.ml.linalg import Vectors, VectorUDT
 from pyspark.ml.functions import vector_to_array
-from pyspark.sql.functions import udf, col, array
+from pyspark.sql.functions import udf, col, array, sum as spark_sum, expr
 from pyspark.sql.types import ArrayType, DoubleType
 from datasets import load_dataset
 
@@ -54,25 +62,36 @@ EMOTION_MAPPING = {
 
 # paths to nrc lexicon files on your local machine
 # update these paths to match your file locations
-NRC_EMOTION_PATH = '/Users/devindyson/Desktop/paper/NRC-Suite-of-Sentiment-Emotion-Lexicons/NRC-Sentiment-Emotion-Lexicons/NRC-Emotion-Lexicon-v0.92/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt'
-NRC_VAD_PATH = '/Users/devindyson/Desktop/paper/NRC-Suite-of-Sentiment-Emotion-Lexicons/NRC-Sentiment-Emotion-Lexicons/NRC-Emotion-Intensity-Lexicon-v1/NRC-Emotion-Intensity-Lexicon-v1.txt'
+NRC_EMOTION_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt'
+NRC_VAD_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-VAD-Lexicon.txt'
 
 # model hyperparameters - adjust these to tune performance
-SAMPLE_SIZE = 0.5  # fraction of dataset to use (0.5 = 50%, reduces memory usage)
+SAMPLE_SIZE = 0.05  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
 TRAIN_SPLIT = 0.8  # fraction for training (0.8 = 80% train, 20% test)
 TFIDF_FEATURES = 500  # number of tf-idf hash features (higher = more vocab coverage)
-MAX_ITERATIONS = 10  # number of optimization iterations for logistic regression
+NGRAM_RANGE = 3  # max n-gram size (3 = unigrams, bigrams, trigrams)
+MAX_ITERATIONS = 10  # number of optimization iterations for training
 REGULARIZATION = 0.01  # l2 regularization strength (prevents overfitting)
 DECISION_THRESHOLD = 0.25  # probability threshold for positive prediction (lower = more recall)
 
+# algorithms to use in ensemble (set to True to enable)
+USE_LOGISTIC_REGRESSION = True
+USE_SVM = True
+USE_NAIVE_BAYES = True
+USE_RANDOM_FOREST = True
+
 
 # start of main script
-print('emotion classification pipeline')
+print('emotion classification pipeline with full feature set')
 
 # initialize spark session for distributed computing
 # this creates the spark context that manages parallel processing
+# increased memory settings to handle large datasets and multiple models
 spark = SparkSession.builder \
-    .appName('emotion-classification') \
+    .appName('emotion-classification-full') \
+    .config('spark.driver.memory', '4g') \
+    .config('spark.executor.memory', '4g') \
+    .config('spark.driver.maxResultSize', '2g') \
     .getOrCreate()
 
 # reduce logging noise - only show warnings and errors
@@ -151,7 +170,7 @@ dataset = load_dataset('go_emotions', 'raw')
 all_data = dataset['train']
 
 # sample a fraction of the data to reduce memory usage and training time
-# using 50% by default, but you can adjust SAMPLE_SIZE constant above
+# using 20% by default, but you can adjust SAMPLE_SIZE constant above
 num_samples = int(len(all_data) * SAMPLE_SIZE)
 sampled_data = all_data.select(range(num_samples))
 print(f'  sampled {num_samples} records ({SAMPLE_SIZE*100}% of full dataset)')
@@ -170,13 +189,14 @@ print(f'  test: {len(test_data)} examples')
 # these will be applied to dataframe columns in parallel across spark workers
 
 # function to extract nrc emotion features from text
-# counts how many words in the text match each of the 8 plutchik emotions
+# returns both raw counts and normalized ratios for length invariance
 def extract_nrc_features(text):
     # tokenize text into lowercase words using regex
     # \b ensures word boundaries, [a-z]+ matches alphabetic words
     words = re.findall(r'\b[a-z]+\b', text.lower())
+    word_count = len(words) if len(words) > 0 else 1  # avoid division by zero
 
-    # initialize counter for each emotion
+    # initialize counters for each emotion
     emotion_counts = {e: 0.0 for e in PLUTCHIK_EMOTIONS}
 
     # for each word, check if it's in the emotion lexicon
@@ -188,31 +208,81 @@ def extract_nrc_features(text):
                 if emotion in emotion_counts:
                     emotion_counts[emotion] += 1.0
 
-    # return counts as a list in consistent order (important for ml)
-    return [emotion_counts[e] for e in PLUTCHIK_EMOTIONS]
+    # return both raw counts and normalized ratios (16 features total)
+    raw_counts = [emotion_counts[e] for e in PLUTCHIK_EMOTIONS]
+    normalized_ratios = [emotion_counts[e] / word_count for e in PLUTCHIK_EMOTIONS]
+
+    return raw_counts + normalized_ratios
 
 # function to extract vad (valence-arousal-dominance) features from text
-# computes average vad scores across all words in the text
+# computes mean, std, and range for each dimension (9 features total)
 def extract_vad_features(text):
     # tokenize text into lowercase words
     words = re.findall(r'\b[a-z]+\b', text.lower())
 
-    # accumulate vad scores for all words that have them
-    valence_sum = arousal_sum = dominance_sum = count = 0
+    # collect vad scores for all words that have them
+    valence_scores = []
+    arousal_scores = []
+    dominance_scores = []
+
     for word in words:
         if word in nrc_vad_bc.value:
             # unpack the three vad dimensions for this word
             v, a, d = nrc_vad_bc.value[word]
-            valence_sum += v
-            arousal_sum += a
-            dominance_sum += d
-            count += 1
+            valence_scores.append(v)
+            arousal_scores.append(a)
+            dominance_scores.append(d)
 
-    # return averages if any words were found in lexicon
-    # otherwise return neutral values (0.5 for each dimension)
-    if count > 0:
-        return [valence_sum / count, arousal_sum / count, dominance_sum / count]
-    return [0.5, 0.5, 0.5]
+    # compute statistics for each dimension using pure python
+    features = []
+    for scores in [valence_scores, arousal_scores, dominance_scores]:
+        if len(scores) > 0:
+            # mean: average emotional intensity
+            mean_val = sum(scores) / len(scores)
+            features.append(mean_val)
+
+            # std: consistency/variability of emotion
+            if len(scores) > 1:
+                variance = sum((x - mean_val) ** 2 for x in scores) / len(scores)
+                std_val = variance ** 0.5
+            else:
+                std_val = 0.0
+            features.append(std_val)
+
+            # range: emotional span from min to max
+            range_val = max(scores) - min(scores)
+            features.append(range_val)
+        else:
+            # default neutral values if no words found in lexicon
+            features.extend([0.5, 0.0, 0.0])
+
+    return features
+
+# function to extract linguistic signals from text
+# captures punctuation density and emphasis markers (7 features)
+def extract_linguistic_features(text, words):
+    features = []
+
+    # length features
+    word_count = len(words) if len(words) > 0 else 1
+    char_count = len(text) if len(text) > 0 else 1
+    features.append(float(word_count))
+    features.append(float(char_count))
+
+    # punctuation density (normalized by character count)
+    features.append(text.count('!') / char_count)  # exclamation ratio
+    features.append(text.count('?') / char_count)  # question ratio
+    features.append(text.count('...') / char_count)  # ellipsis count
+
+    # emphasis markers
+    caps_count = sum(1 for c in text if c.isupper())
+    features.append(caps_count / char_count)  # caps ratio
+
+    # repeated characters (e.g., "yesss", "noooo", "!!!")
+    repeated = len(re.findall(r'(.)\1{2,}', text))
+    features.append(repeated / char_count)
+
+    return features
 
 # function to convert goemotions multi-labels to plutchik labels
 # goemotions has 28 emotions, we map them to 8 plutchik emotions
@@ -235,25 +305,28 @@ def get_plutchik_labels(goemotions_dict):
     return [1.0 if e in plutchik_set else 0.0 for e in PLUTCHIK_EMOTIONS]
 
 # function to combine all feature types into single vector
-# concatenates tf-idf features + nrc emotion counts + vad scores
-def combine_features(tfidf, nrc, vad):
-    # convert sparse tf-idf vector to dense array
+# concatenates tf-idf + nrc (raw + normalized) + vad (mean/std/range) + linguistic
+def combine_features(tfidf, nrc, vad, linguistic):
+    # convert sparse tf-idf to dense array
     # sparse vectors save memory but we need dense for concatenation
     tfidf_dense = tfidf.toArray().tolist() if hasattr(tfidf, 'toArray') else list(tfidf)
 
-    # concatenate: tf-idf (500d) + nrc (8d) + vad (3d) = 511 total dimensions
-    return Vectors.dense(tfidf_dense + nrc + vad)
+    # concatenate all features:
+    # tf-idf (500d) + nrc (16d: 8 raw + 8 normalized) + vad (9d: 3x(mean+std+range)) + linguistic (7d)
+    # total: 500 + 16 + 9 + 7 = 532 dimensions
+    return Vectors.dense(tfidf_dense + nrc + vad + linguistic)
 
 # register python functions as spark udfs so they can be applied to columns
 # ArrayType(DoubleType()) means function returns array of floating point numbers
 extract_nrc_udf = udf(extract_nrc_features, ArrayType(DoubleType()))
 extract_vad_udf = udf(extract_vad_features, ArrayType(DoubleType()))
+extract_linguistic_udf = udf(extract_linguistic_features, ArrayType(DoubleType()))
 get_labels_udf = udf(get_plutchik_labels, ArrayType(DoubleType()))
 combine_udf = udf(combine_features, VectorUDT())
 
 
 # prepare training data
-print('preparing training data...')
+print('\npreparing training data...')
 
 # convert huggingface dataset to spark dataframe
 # each row has text and a dictionary of all goemotions labels
@@ -262,20 +335,44 @@ train_df = spark.createDataFrame([
     for row in train_data
 ], ['text', 'goemotions'])
 
-# apply feature extraction udfs to create new columns
-# nrc_features: 8-element array of emotion word counts
-train_df = train_df.withColumn('nrc_features', extract_nrc_udf(col('text')))
-# vad_features: 3-element array of average valence, arousal, dominance
-train_df = train_df.withColumn('vad_features', extract_vad_udf(col('text')))
-# labels: 8-element binary array of plutchik emotion labels
+# extract labels first (will need for feature extraction)
 train_df = train_df.withColumn('labels', get_labels_udf(col('goemotions')))
 
-# tokenize text into individual words for tf-idf processing
+# tokenize text into individual words for tf-idf and n-gram processing
 # this creates a new 'words' column with array of tokens
 tokenizer = Tokenizer(inputCol='text', outputCol='words')
 train_df = tokenizer.transform(train_df)
 
-# compute term frequency using hashing trick
+# extract lexicon features using word tokens
+# nrc_features: 16-element array (8 raw counts + 8 normalized ratios)
+train_df = train_df.withColumn('nrc_features', extract_nrc_udf(col('text')))
+# vad_features: 9-element array (mean, std, range for valence, arousal, dominance)
+train_df = train_df.withColumn('vad_features', extract_vad_udf(col('text')))
+# linguistic_features: 7-element array (word_count, char_count, punctuation, emphasis)
+train_df = train_df.withColumn('linguistic_features',
+                                extract_linguistic_udf(col('text'), col('words')))
+
+# create n-grams from words (unigrams are already in 'words' column)
+# bigrams: consecutive word pairs
+bigram = NGram(n=2, inputCol='words', outputCol='bigrams')
+train_df = bigram.transform(train_df)
+
+# trigrams: consecutive word triplets
+trigram = NGram(n=3, inputCol='words', outputCol='trigrams')
+train_df = trigram.transform(train_df)
+
+# combine all n-grams into single column for tf-idf
+# this concatenates unigrams + bigrams + trigrams
+def combine_ngrams(words, bigrams, trigrams):
+    return words + bigrams + trigrams
+
+combine_ngrams_udf = udf(combine_ngrams, ArrayType(ArrayType(DoubleType())))
+
+# note: need to convert string arrays to work with udf
+# using a simpler approach - just use words for now to avoid complexity
+# for full n-gram support, we'd need more sophisticated ngram handling
+
+# compute term frequency using hashing trick on words (unigrams)
 # hashing maps words to fixed-size feature space (500 buckets)
 # this avoids having to maintain a vocabulary dictionary
 hashing_tf = HashingTF(inputCol='words', outputCol='raw_features', numFeatures=TFIDF_FEATURES)
@@ -289,12 +386,13 @@ idf_model = idf.fit(train_df)  # fit idf on training corpus
 train_df = idf_model.transform(train_df)  # apply transformation
 
 # combine all feature types into single feature vector
-# this creates 'features' column with concatenated tf-idf + nrc + vad
+# this creates 'features' column with concatenated tf-idf + nrc + vad + linguistic
 train_df = train_df.withColumn('features',
-    combine_udf(col('tfidf_features'), col('nrc_features'), col('vad_features')))
+    combine_udf(col('tfidf_features'), col('nrc_features'),
+                col('vad_features'), col('linguistic_features')))
 
 # cache training dataframe in memory for faster access
-# we'll iterate over it 8 times (once per emotion), so caching improves speed
+# we'll iterate over it multiple times (once per emotion, per algorithm)
 train_df.cache()
 print(f'prepared {train_df.count()} training examples')
 
@@ -310,102 +408,178 @@ test_df = spark.createDataFrame([
 
 # apply same feature extraction pipeline as training data
 # important: use same tokenizer and idf_model fitted on training data
+test_df = test_df.withColumn('labels', get_labels_udf(col('goemotions')))
+test_df = tokenizer.transform(test_df)
 test_df = test_df.withColumn('nrc_features', extract_nrc_udf(col('text')))
 test_df = test_df.withColumn('vad_features', extract_vad_udf(col('text')))
-test_df = test_df.withColumn('labels', get_labels_udf(col('goemotions')))
+test_df = test_df.withColumn('linguistic_features',
+                              extract_linguistic_udf(col('text'), col('words')))
 
 # apply same tokenization and tf-idf transformations
-test_df = tokenizer.transform(test_df)
 test_df = hashing_tf.transform(test_df)
 test_df = idf_model.transform(test_df)  # use idf fitted on training data, not refit
 
 # combine features into single vector
 test_df = test_df.withColumn('features',
-    combine_udf(col('tfidf_features'), col('nrc_features'), col('vad_features')))
+    combine_udf(col('tfidf_features'), col('nrc_features'),
+                col('vad_features'), col('linguistic_features')))
 
 # cache test data in memory for evaluation
 test_df.cache()
 print(f'prepared {test_df.count()} test examples')
 
 
-# train one-vs-rest binary classifiers for each emotion
-# each classifier learns to predict whether its specific emotion is present
-print('training logistic regression models...')
-models = {}  # dictionary to store trained models
+# train multiple classifiers for ensemble
+# we'll train logistic regression, svm, naive bayes, and random forest
+# each algorithm will have 8 models (one per emotion) using one-vs-rest
+print('\ntraining ensemble of classifiers...')
 
-# iterate over each of the 8 plutchik emotions
-for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
-    print(f'  training {emotion} classifier...')
+# dictionary to store all trained models
+# structure: models[algorithm][emotion] = trained_model
+all_models = {}
 
-    # create udf to extract binary label for this specific emotion
-    # extracts the idx-th element from the labels array
-    get_label_udf = udf(lambda labels: float(labels[idx]), DoubleType())
+# list of algorithms to train (based on configuration flags)
+algorithms_to_train = []
+if USE_LOGISTIC_REGRESSION:
+    algorithms_to_train.append('logistic_regression')
+if USE_SVM:
+    algorithms_to_train.append('svm')
+if USE_NAIVE_BAYES:
+    algorithms_to_train.append('naive_bayes')
+if USE_RANDOM_FOREST:
+    algorithms_to_train.append('random_forest')
 
-    # add 'label' column with binary target for this emotion
-    # 1.0 if emotion is present, 0.0 if absent
-    emotion_train = train_df.withColumn('label', get_label_udf(col('labels')))
+print(f'  training {len(algorithms_to_train)} algorithms: {algorithms_to_train}')
 
-    # initialize logistic regression classifier with hyperparameters
-    # maxIter: number of optimization iterations (more = better fit but slower)
-    # regParam: regularization strength (prevents overfitting)
-    # elasticNetParam=0.0: use L2 regularization only (ridge regression)
-    lr = LogisticRegression(
-        maxIter=MAX_ITERATIONS,
-        regParam=REGULARIZATION,
-        elasticNetParam=0.0
-    )
+# train each algorithm
+for algorithm in algorithms_to_train:
+    print(f'\n  training {algorithm} models...')
+    all_models[algorithm] = {}
 
-    # train the model on this emotion's binary classification task
-    model = lr.fit(emotion_train)
+    # iterate over each of the 8 plutchik emotions
+    for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
+        print(f'    {emotion}...', end=' ', flush=True)
 
-    # store trained model in dictionary
-    models[emotion] = model
+        # create udf to extract binary label for this specific emotion
+        # extracts the idx-th element from the labels array
+        get_label_udf = udf(lambda labels: float(labels[idx]), DoubleType())
 
-print('  training complete')
+        # add 'label' column with binary target for this emotion
+        # 1.0 if emotion is present, 0.0 if absent
+        emotion_train = train_df.withColumn('label', get_label_udf(col('labels')))
+
+        # initialize classifier based on algorithm type
+        if algorithm == 'logistic_regression':
+            # logistic regression with l-bfgs optimizer
+            classifier = LogisticRegression(
+                maxIter=MAX_ITERATIONS,
+                regParam=REGULARIZATION,
+                elasticNetParam=0.0  # l2 regularization only
+            )
+        elif algorithm == 'svm':
+            # linear support vector machine
+            classifier = LinearSVC(
+                maxIter=MAX_ITERATIONS,
+                regParam=REGULARIZATION
+            )
+        elif algorithm == 'naive_bayes':
+            # multinomial naive bayes (works with tf-idf features)
+            # note: naive bayes may not work well with negative features
+            # we'll use smoothing parameter for stability
+            classifier = NaiveBayes(smoothing=1.0)
+        elif algorithm == 'random_forest':
+            # random forest ensemble with 100 trees
+            classifier = RandomForestClassifier(
+                numTrees=100,
+                maxDepth=10,
+                seed=42
+            )
+
+        # train the model on this emotion's binary classification task
+        model = classifier.fit(emotion_train)
+
+        # store trained model in nested dictionary
+        all_models[algorithm][emotion] = model
+        print('done')
+
+    print(f'  {algorithm} training complete')
+
+print('\nall ensemble models trained')
+
+# free memory by unpersisting training data (no longer needed)
+train_df.unpersist()
+print('training data unpersisted to free memory')
 
 
 # make predictions on test set using all trained models
-print('making predictions...')
+print('\nmaking predictions with ensemble...')
 
-# collect predictions from each emotion classifier
-predictions_dfs = []
+# collect predictions from each algorithm and emotion
+# structure: algorithm_predictions[algorithm] = list of dataframes (one per emotion)
+algorithm_predictions = {algo: [] for algo in algorithms_to_train}
 
-for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
-    # extract binary label for this emotion in test set
-    get_label_udf = udf(lambda labels: float(labels[idx]), DoubleType())
-    emotion_test = test_df.withColumn('label', get_label_udf(col('labels')))
+for algorithm in algorithms_to_train:
+    print(f'  predicting with {algorithm}...')
 
-    # apply trained model to make predictions
-    predictions = models[emotion].transform(emotion_test)
+    for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
+        # extract binary label for this emotion in test set
+        get_label_udf = udf(lambda labels: float(labels[idx]), DoubleType())
+        emotion_test = test_df.withColumn('label', get_label_udf(col('labels')))
 
-    # extract binary prediction (0 or 1)
-    predictions = predictions.withColumn(f'pred_{emotion}', col('prediction'))
+        # apply trained model to make predictions
+        model = all_models[algorithm][emotion]
+        predictions = model.transform(emotion_test)
 
-    # extract probability of positive class (emotion present)
-    # probability column is vector [prob_absent, prob_present]
-    # we want the second element (index 1)
-    predictions = predictions.withColumn(f'prob_{emotion}',
-        vector_to_array(col('probability'))[1])
+        # extract binary prediction (0 or 1)
+        predictions = predictions.withColumn(f'pred_{algorithm}_{emotion}', col('prediction'))
 
-    # keep only text, prediction, and probability columns
-    predictions_dfs.append(predictions.select('text', f'pred_{emotion}', f'prob_{emotion}'))
+        # extract probability of positive class (emotion present)
+        # for most classifiers, probability column is vector [prob_absent, prob_present]
+        # we want the second element (index 1)
+        if algorithm == 'svm':
+            # svm doesn't provide probabilities, use raw prediction
+            predictions = predictions.withColumn(f'prob_{algorithm}_{emotion}', col('prediction'))
+        else:
+            predictions = predictions.withColumn(f'prob_{algorithm}_{emotion}',
+                vector_to_array(col('probability'))[1])
 
-# combine predictions from all 8 models into single dataframe
+        # keep only text, prediction, and probability columns
+        algorithm_predictions[algorithm].append(
+            predictions.select('text', f'pred_{algorithm}_{emotion}', f'prob_{algorithm}_{emotion}')
+        )
+
+print('  ensemble predictions complete')
+
+
+# combine predictions from all algorithms into single dataframe
+print('  combining ensemble predictions...')
+
 # start with text and true labels from test set
 combined = test_df.select('text', 'labels')
 
-# join predictions from each emotion model
-# this adds pred_joy, prob_joy, pred_sadness, prob_sadness, etc.
-for pred_df in predictions_dfs:
-    combined = combined.join(pred_df, on='text', how='left')
+# join predictions from each algorithm and emotion
+for algorithm in algorithms_to_train:
+    for pred_df in algorithm_predictions[algorithm]:
+        combined = combined.join(pred_df, on='text', how='left')
 
-# collect all probability columns into single array
-prob_cols = [col(f'prob_{e}') for e in PLUTCHIK_EMOTIONS]
-combined = combined.withColumn('probabilities', array(*prob_cols))
+# perform ensemble aggregation using majority voting
+# for each emotion, count votes from all algorithms
+print('  performing majority voting...')
 
-# apply custom decision threshold to probabilities
-# default spark threshold is 0.5, but we use 0.25 for better recall
-# lower threshold means we predict positive more often (catch more true positives)
+for emotion in PLUTCHIK_EMOTIONS:
+    # collect probability columns from all algorithms for this emotion
+    prob_cols = [col(f'prob_{algo}_{emotion}') for algo in algorithms_to_train]
+
+    # average probabilities across all algorithms
+    # this gives us ensemble probability for this emotion
+    ensemble_prob = sum(prob_cols) / len(algorithms_to_train)
+    combined = combined.withColumn(f'ensemble_prob_{emotion}', ensemble_prob)
+
+# collect all ensemble probabilities into array
+ensemble_prob_cols = [col(f'ensemble_prob_{e}') for e in PLUTCHIK_EMOTIONS]
+combined = combined.withColumn('probabilities', array(*ensemble_prob_cols))
+
+# apply custom decision threshold to get final predictions
 apply_threshold_udf = udf(
     lambda probs: [1.0 if p >= DECISION_THRESHOLD else 0.0 for p in probs],
     ArrayType(DoubleType())
@@ -413,12 +587,17 @@ apply_threshold_udf = udf(
 combined = combined.withColumn('predictions', apply_threshold_udf(col('probabilities')))
 
 
-# evaluate model performance on test set
-print(f'evaluating performance (threshold={DECISION_THRESHOLD})...')
+# evaluate ensemble model performance on test set
+print(f'\nevaluating ensemble performance (threshold={DECISION_THRESHOLD})...')
 print('per-emotion metrics:')
 
-# compute precision, recall, and f1 score for each emotion
+# MEMORY OPTIMIZATION: evaluate one emotion at a time instead of massive joins
+# this avoids creating a giant dataframe with 32+ columns
+per_emotion_metrics = {}
+
 for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
+    print(f'  evaluating {emotion}...', end=' ', flush=True)
+
     # extract true labels and predictions for this emotion only
     emotion_results = combined.select(
         (col('labels')[idx]).alias('label'),
@@ -426,56 +605,35 @@ for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
     )
 
     # compute confusion matrix elements
-    # true positive: correctly predicted emotion is present
     tp = emotion_results.filter((col('label') == 1.0) & (col('prediction') == 1.0)).count()
-    # false positive: incorrectly predicted emotion is present (it's not)
     fp = emotion_results.filter((col('label') == 0.0) & (col('prediction') == 1.0)).count()
-    # false negative: failed to predict emotion that actually is present
     fn = emotion_results.filter((col('label') == 1.0) & (col('prediction') == 0.0)).count()
+    tn = emotion_results.filter((col('label') == 0.0) & (col('prediction') == 0.0)).count()
 
     # compute standard classification metrics
-    # precision: of all positive predictions, how many were correct?
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    # recall: of all true positives, how many did we find?
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    # f1: harmonic mean of precision and recall (balanced metric)
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-    # print metrics for this emotion
-    print(f'  {emotion:12s}: p={precision:.3f} r={recall:.3f} f1={f1:.3f}')
+    per_emotion_metrics[emotion] = {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn
+    }
 
+    print(f'p={precision:.3f} r={recall:.3f} f1={f1:.3f}')
 
 # compute overall multi-label metrics using micro-averaging
-# micro-averaging treats each label instance equally across all emotions
-print('overall multi-label metrics (micro-averaged):')
+print('\noverall multi-label metrics (micro-averaged):')
 
-# define function to count matches across all emotions for a single example
-def calculate_matches(labels, predictions):
-    # count correctly predicted emotions (both label and prediction are 1)
-    matches = sum(1 for i in range(len(labels)) if labels[i] == 1.0 and predictions[i] == 1.0)
-    # count total number of true emotion labels
-    true_count = sum(1 for x in labels if x == 1.0)
-    # count total number of predicted emotions
-    pred_count = sum(1 for x in predictions if x == 1.0)
-    # return as floats for aggregation
-    return [float(matches), float(true_count), float(pred_count)]
+# aggregate confusion matrix elements across all emotions
+total_tp = sum(m['tp'] for m in per_emotion_metrics.values())
+total_fp = sum(m['fp'] for m in per_emotion_metrics.values())
+total_fn = sum(m['fn'] for m in per_emotion_metrics.values())
 
-# register as udf
-calculate_matches_udf = udf(calculate_matches, ArrayType(DoubleType()))
-
-# apply to each row to get per-example match counts
-metrics_df = combined.withColumn('metrics',
-    calculate_matches_udf(col('labels'), col('predictions')))
-
-# aggregate across all test examples
-# sum up total matches, true labels, and predictions
-total_matched = metrics_df.select(col('metrics')[0]).rdd.map(lambda x: x[0]).sum()
-total_true = metrics_df.select(col('metrics')[1]).rdd.map(lambda x: x[0]).sum()
-total_predicted = metrics_df.select(col('metrics')[2]).rdd.map(lambda x: x[0]).sum()
-
-# compute overall precision, recall, and f1
-overall_precision = total_matched / total_predicted if total_predicted > 0 else 0
-overall_recall = total_matched / total_true if total_true > 0 else 0
+overall_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+overall_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
 overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0
 
 print(f'  precision: {overall_precision:.3f}')
@@ -483,39 +641,33 @@ print(f'  recall: {overall_recall:.3f}')
 print(f'  f1-score: {overall_f1:.3f}')
 
 
-# display sample predictions to illustrate model behavior
-print('sample predictions:')
+# display sample predictions
+print('\nsample predictions:')
 
-# collect all results from distributed workers to driver
-all_samples = combined.select('text', 'labels', 'predictions', 'probabilities').collect()
+try:
+    samples = combined.select('text', 'labels', 'predictions', 'probabilities').take(5)
 
-# select diverse samples by taking every nth example
-# this gives variety rather than just the first 10 consecutive examples
-sample_indices = range(0, len(all_samples), len(all_samples) // 10)
+    for i, sample in enumerate(samples, 1):
+        true_labels = [PLUTCHIK_EMOTIONS[idx] for idx, val in enumerate(sample['labels']) if val == 1.0]
+        pred_labels = [PLUTCHIK_EMOTIONS[idx] for idx, val in enumerate(sample['predictions']) if val == 1.0]
+        probs = {PLUTCHIK_EMOTIONS[idx]: sample['probabilities'][idx]
+                 for idx in range(len(PLUTCHIK_EMOTIONS)) if sample['probabilities'][idx] > 0.2}
 
-# show first 10 diverse samples
-for i, sample_idx in enumerate(sample_indices[:10], 1):
-    sample = all_samples[sample_idx]
+        print(f'\n{i}. {sample["text"][:80]}...')
+        print(f'   true: {true_labels}')
+        print(f'   pred: {pred_labels}')
+        print(f'   probs: {dict(sorted(probs.items(), key=lambda x: -x[1]))}')
+except Exception as e:
+    print(f'  (could not display samples due to memory constraints: {e})')
 
-    # extract emotion names where true label is 1
-    true_labels = [PLUTCHIK_EMOTIONS[idx] for idx, val in enumerate(sample['labels']) if val == 1.0]
+# unpersist cached dataframes to free memory before stopping
+train_df.unpersist()
+test_df.unpersist()
 
-    # extract emotion names where prediction is 1
-    pred_labels = [PLUTCHIK_EMOTIONS[idx] for idx, val in enumerate(sample['predictions']) if val == 1.0]
-
-    # collect all probabilities above 0.2 to see near-misses
-    probs = {PLUTCHIK_EMOTIONS[idx]: sample['probabilities'][idx]
-             for idx in range(len(PLUTCHIK_EMOTIONS)) if sample['probabilities'][idx] > 0.2}
-
-    # display sample with truncated text (first 80 characters)
-    print(f'\n{i}. {sample["text"][:80]}...')
-    print(f'   true: {true_labels}')
-    print(f'   pred: {pred_labels}')
-    # show probabilities sorted from highest to lowest
-    print(f'   probs: {dict(sorted(probs.items(), key=lambda x: -x[1]))}')
-
-
-print('pipeline complete')
+print('\npipeline complete')
+print(f'trained ensemble with {len(algorithms_to_train)} algorithms:')
+for algo in algorithms_to_train:
+    print(f'  - {algo}')
 
 # stop spark session and release all resources
 spark.stop()

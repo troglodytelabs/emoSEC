@@ -1,0 +1,22 @@
+# IMPORTANT: python 3.14 has compatibility issues with pyspark
+# recommended: use python 3.11 or 3.12 instead
+# if you must use python 3.14, install setuptools first (see below)
+
+# setuptools provides distutils for python 3.12+ (INSTALL THIS FIRST)
+setuptools>=65.0.0
+
+# spark for distributed computing
+pyspark==3.5.3
+
+# huggingface datasets for goemotions
+datasets==2.14.6
+
+# installation order for python 3.14:
+# 1. pip install setuptools>=65.0.0
+# 2. pip install pyspark==3.5.3
+# 3. pip install datasets==2.14.6
+
+# note: java 8+ required for spark
+# mac: brew install openjdk@11
+# linux: apt-get install openjdk-11-jdk
+# windows: download from oracle or adoptopenjdk
