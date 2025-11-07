@@ -66,7 +66,7 @@ NRC_EMOTION_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-Emotio
 NRC_VAD_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-VAD-Lexicon.txt'
 
 # model hyperparameters - adjust these to tune performance
-SAMPLE_SIZE = 0.05  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
+SAMPLE_SIZE = 0.02  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
 TRAIN_SPLIT = 0.8  # fraction for training (0.8 = 80% train, 20% test)
 TFIDF_FEATURES = 500  # number of tf-idf hash features (higher = more vocab coverage)
 NGRAM_RANGE = 3  # max n-gram size (3 = unigrams, bigrams, trigrams)
@@ -586,13 +586,24 @@ apply_threshold_udf = udf(
 )
 combined = combined.withColumn('predictions', apply_threshold_udf(col('probabilities')))
 
+# cache combined for evaluation and free up memory from individual predictions
+combined.cache()
+combined.count()  # force evaluation to materialize cache
+print(f'  combined dataframe ready with {combined.count()} examples')
+
+# free memory from test_df since we have everything in combined now
+test_df.unpersist()
+print('  test data unpersisted to free memory')
+
 
 # evaluate ensemble model performance on test set
 print(f'\nevaluating ensemble performance (threshold={DECISION_THRESHOLD})...')
 print('per-emotion metrics:')
 
-# MEMORY OPTIMIZATION: evaluate one emotion at a time instead of massive joins
-# this avoids creating a giant dataframe with 32+ columns
+# MEMORY OPTIMIZATION: evaluate one emotion at a time using aggregation (no count()!)
+# count() materializes filtered dataframes - instead use sum() aggregation
+from pyspark.sql.functions import sum as spark_sum, when
+
 per_emotion_metrics = {}
 
 for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
@@ -604,11 +615,19 @@ for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
         (col('predictions')[idx]).alias('prediction')
     )
 
-    # compute confusion matrix elements
-    tp = emotion_results.filter((col('label') == 1.0) & (col('prediction') == 1.0)).count()
-    fp = emotion_results.filter((col('label') == 0.0) & (col('prediction') == 1.0)).count()
-    fn = emotion_results.filter((col('label') == 1.0) & (col('prediction') == 0.0)).count()
-    tn = emotion_results.filter((col('label') == 0.0) & (col('prediction') == 0.0)).count()
+    # compute ALL confusion matrix elements in ONE pass using aggregation
+    # this is much more memory efficient than 4 separate filter().count() calls
+    confusion = emotion_results.agg(
+        spark_sum(when((col('label') == 1.0) & (col('prediction') == 1.0), 1).otherwise(0)).alias('tp'),
+        spark_sum(when((col('label') == 0.0) & (col('prediction') == 1.0), 1).otherwise(0)).alias('fp'),
+        spark_sum(when((col('label') == 1.0) & (col('prediction') == 0.0), 1).otherwise(0)).alias('fn'),
+        spark_sum(when((col('label') == 0.0) & (col('prediction') == 0.0), 1).otherwise(0)).alias('tn')
+    ).collect()[0]
+
+    tp = confusion['tp'] or 0
+    fp = confusion['fp'] or 0
+    fn = confusion['fn'] or 0
+    tn = confusion['tn'] or 0
 
     # compute standard classification metrics
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
@@ -661,8 +680,7 @@ except Exception as e:
     print(f'  (could not display samples due to memory constraints: {e})')
 
 # unpersist cached dataframes to free memory before stopping
-train_df.unpersist()
-test_df.unpersist()
+combined.unpersist()
 
 print('\npipeline complete')
 print(f'trained ensemble with {len(algorithms_to_train)} algorithms:')
