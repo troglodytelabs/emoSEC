@@ -1,23 +1,7 @@
 [project]
-name = "emo-spark"
+name = "emospark"
 version = "0.1.0"
-description = "Distributed multi-label emotion classification with PySpark"
+description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "matplotlib>=3.10.7",
-    "numpy>=2.3.4",
-    "pandas>=2.3.3",
-    "pyspark>=4.0.1",
-    "seaborn>=0.13.2",
-]
-
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-package-dir = { "" = "src" }
-
-[tool.setuptools.packages.find]
-where = ["src"]
+dependencies = ["datasets>=4.4.1", "pyspark>=4.0.1"]
