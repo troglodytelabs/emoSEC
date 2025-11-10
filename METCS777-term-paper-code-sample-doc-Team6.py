@@ -65,6 +65,11 @@ EMOTION_MAPPING = {
 NRC_EMOTION_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt'
 NRC_VAD_PATH = '/Users/devindyson/Desktop/troglodytelabs/emoSpark/NRC-VAD-Lexicon.txt'
 
+# GCP path (uncomment for Dataproc) // or AWS path (uncomment for EMR)
+# NRC_EMOTION_PATH = 'gs://emoSpark-data/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt'
+# NRC_VAD_PATH = 'gs://emoSpark-data/NRC-VAD-Lexicon.txt'
+
+
 # model hyperparameters - adjust these to tune performance
 SAMPLE_SIZE = 0.01  # fraction of dataset to use (0.1 = 10%, reduces memory usage)
 TRAIN_SPLIT = 0.8  # fraction for training (0.8 = 80% train, 20% test)
