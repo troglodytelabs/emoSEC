@@ -191,11 +191,16 @@ def compute_multilabel_metrics(
     micro_tp = micro_fp = micro_fn = 0.0
 
     for label in label_cols:
-        # Extract confusion matrix values for this label
-        tp = float(agg_row.get(f"{label}_tp", 0.0))
-        fp = float(agg_row.get(f"{label}_fp", 0.0))
-        fn = float(agg_row.get(f"{label}_fn", 0.0))
-        support = int(agg_row.get(f"{label}_support", 0))
+        # Extract confusion matrix values for this label, defaulting None to 0
+        tp_val = agg_row.get(f"{label}_tp")
+        fp_val = agg_row.get(f"{label}_fp")
+        fn_val = agg_row.get(f"{label}_fn")
+        support_val = agg_row.get(f"{label}_support")
+
+        tp = float(tp_val) if tp_val is not None else 0.0
+        fp = float(fp_val) if fp_val is not None else 0.0
+        fn = float(fn_val) if fn_val is not None else 0.0
+        support = int(support_val) if support_val is not None else 0
 
         # Precision: Of all examples we predicted positive, how many were correct?
         # precision = TP / (TP + FP) = correct positives / all predicted positives
