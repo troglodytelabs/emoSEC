@@ -14,6 +14,9 @@ author: group 6 - devin dyson, madhur deep jain
 date: november 5, 2025
 """
 
+import json
+from pathlib import Path
+
 from pyspark.sql import SparkSession
 from pyspark.ml.feature import HashingTF, IDF, Tokenizer, NGram
 from pyspark.ml.classification import (
@@ -22,14 +25,14 @@ from pyspark.ml.classification import (
     NaiveBayes,
     RandomForestClassifier,
 )
-from pyspark.ml.functions import vector_to_array
-from pyspark.sql.functions import udf, col, array, sum as spark_sum, when
-from pyspark.sql.types import ArrayType, DoubleType
+from pyspark.sql.functions import col, sum as spark_sum, when, lit
+from pyspark.sql.types import DoubleType
 from datasets import load_dataset
 
 from config import (
     DECISION_THRESHOLD,
     GOEMOTIONS_LABELS,
+    MODEL_BASE_PATH,
     MAX_ITERATIONS,
     NRC_EMOTION_PATH,
     NRC_VAD_PATH,
@@ -54,6 +57,11 @@ from lexicon_utils import (
     broadcast_lexicons,
     load_nrc_emotion_lexicon,
     load_nrc_vad_lexicon,
+)
+from training_utils import (
+    compute_class_weights,
+    generate_ensemble_outputs,
+    tune_thresholds,
 )
 
 
@@ -85,13 +93,24 @@ def run_pipeline():
 
     num_samples = int(len(all_data) * SAMPLE_SIZE)
     sampled_data = all_data.select(range(num_samples))
+    sampled_rows = [
+        (
+            idx,
+            row["text"],
+            {emotion: row.get(emotion, 0) for emotion in GOEMOTIONS_LABELS},
+        )
+        for idx, row in enumerate(sampled_data)
+    ]
     print(f"  sampled {num_samples} records ({SAMPLE_SIZE * 100}% of full dataset)")
 
-    split_idx = int(len(sampled_data) * TRAIN_SPLIT)
-    train_data = sampled_data.select(range(split_idx))
-    test_data = sampled_data.select(range(split_idx, len(sampled_data)))
-    print(f"  train: {len(train_data)} examples")
-    print(f"  test: {len(test_data)} examples")
+    split_idx = int(len(sampled_rows) * TRAIN_SPLIT)
+    train_rows = sampled_rows[:split_idx]
+    test_rows = sampled_rows[split_idx:]
+    print(f"  train: {len(train_rows)} examples")
+    print(f"  test: {len(test_rows)} examples")
+
+    model_dir = Path(MODEL_BASE_PATH)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     labels_udf = get_labels_udf()
     extract_nrc_udf = get_extract_nrc_udf(nrc_lexicon_bc)
@@ -102,39 +121,36 @@ def run_pipeline():
     tokenizer = Tokenizer(inputCol="text", outputCol="words")
 
     print("\npreparing training data...")
-    train_df = spark.createDataFrame(
-        [
-            (
-                row["text"],
-                {emotion: row.get(emotion, 0) for emotion in GOEMOTIONS_LABELS},
-            )
-            for row in train_data
-        ],
-        ["text", "goemotions"],
+    full_train_df = spark.createDataFrame(train_rows, ["row_id", "text", "goemotions"])
+    full_train_df = full_train_df.withColumn("labels", labels_udf(col("goemotions")))
+    full_train_df = tokenizer.transform(full_train_df)
+    full_train_df = full_train_df.withColumn(
+        "nrc_features", extract_nrc_udf(col("text"))
     )
-    train_df = train_df.withColumn("labels", labels_udf(col("goemotions")))
-    train_df = tokenizer.transform(train_df)
-    train_df = train_df.withColumn("nrc_features", extract_nrc_udf(col("text")))
-    train_df = train_df.withColumn("vad_features", extract_vad_udf(col("text")))
-    train_df = train_df.withColumn(
+    full_train_df = full_train_df.withColumn(
+        "vad_features", extract_vad_udf(col("text"))
+    )
+    full_train_df = full_train_df.withColumn(
         "linguistic_features", extract_linguistic_udf(col("text"), col("words"))
     )
 
     bigram = NGram(n=2, inputCol="words", outputCol="bigrams")
-    train_df = bigram.transform(train_df)
+    full_train_df = bigram.transform(full_train_df)
     trigram = NGram(n=3, inputCol="words", outputCol="trigrams")
-    train_df = trigram.transform(train_df)
+    full_train_df = trigram.transform(full_train_df)
 
     hashing_tf = HashingTF(
         inputCol="words", outputCol="raw_features", numFeatures=TFIDF_FEATURES
     )
-    train_df = hashing_tf.transform(train_df)
+    full_train_df = hashing_tf.transform(full_train_df)
 
     idf = IDF(inputCol="raw_features", outputCol="tfidf_features")
-    idf_model = idf.fit(train_df)
-    train_df = idf_model.transform(train_df)
+    idf_model = idf.fit(full_train_df)
+    idf_output_path = model_dir / "idf_model"
+    idf_model.write().overwrite().save(str(idf_output_path))
+    full_train_df = idf_model.transform(full_train_df)
 
-    train_df = train_df.withColumn(
+    full_train_df = full_train_df.withColumn(
         "features",
         combine_udf(
             col("tfidf_features"),
@@ -144,20 +160,19 @@ def run_pipeline():
         ),
     )
 
-    train_df.cache()
-    print(f"prepared {train_df.count()} training examples")
+    train_df, val_df = full_train_df.randomSplit([0.9, 0.1], seed=42)
+    train_df = train_df.cache()
+    val_df = val_df.cache()
+    train_count = train_df.count()
+    val_count = val_df.count()
+    print(f"prepared {train_count} training examples")
+    print(f"prepared {val_count} validation examples")
+
+    class_weights = compute_class_weights(train_df, train_count, PLUTCHIK_EMOTIONS)
+    print("computed per-emotion class weights for imbalance handling")
 
     print("preparing test data...")
-    test_df = spark.createDataFrame(
-        [
-            (
-                row["text"],
-                {emotion: row.get(emotion, 0) for emotion in GOEMOTIONS_LABELS},
-            )
-            for row in test_data
-        ],
-        ["text", "goemotions"],
-    )
+    test_df = spark.createDataFrame(test_rows, ["row_id", "text", "goemotions"])
     test_df = test_df.withColumn("labels", labels_udf(col("goemotions")))
     test_df = tokenizer.transform(test_df)
     test_df = test_df.withColumn("nrc_features", extract_nrc_udf(col("text")))
@@ -200,8 +215,16 @@ def run_pipeline():
         all_models[algorithm] = {}
         for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
             print(f"    {emotion}...", end=" ", flush=True)
-            get_label_udf = udf(lambda labels, i=idx: float(labels[i]), DoubleType())
-            emotion_train = train_df.withColumn("label", get_label_udf(col("labels")))
+            emotion_train = train_df.withColumn(
+                "label", col("labels").getItem(idx).cast(DoubleType())
+            )
+            weights = class_weights[emotion]
+            emotion_train = emotion_train.withColumn(
+                "weight",
+                when(col("label") == 1.0, lit(weights["positive"])).otherwise(
+                    lit(weights["negative"])
+                ),
+            )
 
             if algorithm == "logistic_regression":
                 classifier = LogisticRegression(
@@ -218,83 +241,70 @@ def run_pipeline():
             else:
                 raise ValueError(f"Unknown algorithm: {algorithm}")
 
+            classifier = classifier.setWeightCol("weight")
             model = classifier.fit(emotion_train)
             all_models[algorithm][emotion] = model
-            print("done")
+            save_path = model_dir / algorithm / emotion
+            model.write().overwrite().save(str(save_path))
+            print("saved")
         print(f"  {algorithm} training complete")
 
     print("\nall ensemble models trained")
     train_df.unpersist()
     print("training data unpersisted to free memory")
 
-    print("\nmaking predictions with ensemble...")
-    algorithm_predictions = {algo: [] for algo in algorithms_to_train}
-    for algorithm in algorithms_to_train:
-        print(f"  predicting with {algorithm}...")
-        for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
-            get_label_udf = udf(lambda labels, i=idx: float(labels[i]), DoubleType())
-            emotion_test = test_df.withColumn("label", get_label_udf(col("labels")))
-            model = all_models[algorithm][emotion]
-            predictions = model.transform(emotion_test)
-            predictions = predictions.withColumn(
-                f"pred_{algorithm}_{emotion}", col("prediction")
-            )
-            if algorithm == "svm":
-                predictions = predictions.withColumn(
-                    f"prob_{algorithm}_{emotion}", col("prediction")
-                )
-            else:
-                predictions = predictions.withColumn(
-                    f"prob_{algorithm}_{emotion}",
-                    vector_to_array(col("probability"))[1],
-                )
-            algorithm_predictions[algorithm].append(
-                predictions.select(
-                    "text",
-                    f"pred_{algorithm}_{emotion}",
-                    f"prob_{algorithm}_{emotion}",
-                )
-            )
-    print("  ensemble predictions complete")
+    val_combined = generate_ensemble_outputs(
+        val_df,
+        "validation",
+        algorithms_to_train,
+        PLUTCHIK_EMOTIONS,
+        all_models,
+        DECISION_THRESHOLD,
+    )
+    tuned_thresholds = tune_thresholds(
+        val_combined, PLUTCHIK_EMOTIONS, DECISION_THRESHOLD
+    )
+    val_combined.unpersist()
+    val_df.unpersist()
 
-    print("  combining ensemble predictions...")
-    combined = test_df.select("text", "labels")
-    for algorithm in algorithms_to_train:
-        for pred_df in algorithm_predictions[algorithm]:
-            combined = combined.join(pred_df, on="text", how="left")
-
-    print("  performing majority voting...")
+    print("\nusing tuned thresholds per emotion:")
     for emotion in PLUTCHIK_EMOTIONS:
-        prob_cols = [col(f"prob_{algo}_{emotion}") for algo in algorithms_to_train]
-        ensemble_prob = sum(prob_cols) / len(algorithms_to_train)
-        combined = combined.withColumn(f"ensemble_prob_{emotion}", ensemble_prob)
+        print(f"  {emotion}: {tuned_thresholds[emotion]:.3f}")
 
-    ensemble_prob_cols = [
-        col(f"ensemble_prob_{emotion}") for emotion in PLUTCHIK_EMOTIONS
-    ]
-    combined = combined.withColumn("probabilities", array(*ensemble_prob_cols))
+    metadata = {
+        "algorithms": algorithms_to_train,
+        "emotions": PLUTCHIK_EMOTIONS,
+        "decision_threshold": DECISION_THRESHOLD,
+        "thresholds": tuned_thresholds,
+        "tfidf_features": TFIDF_FEATURES,
+    }
+    metadata_path = model_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    print(f"model artifacts stored in {model_dir}")
 
-    apply_threshold_udf = udf(
-        lambda probs: [1.0 if prob >= DECISION_THRESHOLD else 0.0 for prob in probs],
-        ArrayType(DoubleType()),
+    combined = generate_ensemble_outputs(
+        test_df,
+        "test",
+        algorithms_to_train,
+        PLUTCHIK_EMOTIONS,
+        all_models,
+        DECISION_THRESHOLD,
+        thresholds=tuned_thresholds,
     )
-    combined = combined.withColumn(
-        "predictions", apply_threshold_udf(col("probabilities"))
-    )
-
-    combined.cache()
-    combined.count()
-    print(f"  combined dataframe ready with {combined.count()} examples")
-
     test_df.unpersist()
-    print("  test data unpersisted to free memory")
+    print("test data unpersisted to free memory")
 
-    print(f"\nevaluating ensemble performance (threshold={DECISION_THRESHOLD})...")
+    print("\nevaluating ensemble performance with tuned thresholds...")
     print("per-emotion metrics:")
 
     per_emotion_metrics = {}
     for idx, emotion in enumerate(PLUTCHIK_EMOTIONS):
-        print(f"  evaluating {emotion}...", end=" ", flush=True)
+        threshold_value = tuned_thresholds.get(emotion, DECISION_THRESHOLD)
+        print(
+            f"  evaluating {emotion} (threshold={threshold_value:.3f})...",
+            end=" ",
+            flush=True,
+        )
         emotion_results = combined.select(
             (col("labels")[idx]).alias("label"),
             (col("predictions")[idx]).alias("prediction"),

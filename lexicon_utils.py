@@ -39,11 +39,15 @@ def load_nrc_vad_lexicon(path: str) -> Dict[str, Tuple[float, float, float]]:
                 continue
             word = parts[0]
             try:
-                valence = float(parts[1])
-                arousal = float(parts[2])
-                dominance = float(parts[3])
+                raw_valence = float(parts[1])
+                raw_arousal = float(parts[2])
+                raw_dominance = float(parts[3])
             except ValueError:
                 continue
+            # the original lexicon stores scores in [-1, 1]; shift to [0, 1] so that downstream feature vectors remain non-negative for algorithms such as multinomial naive bayes.
+            valence = (raw_valence + 1.0) / 2.0
+            arousal = (raw_arousal + 1.0) / 2.0
+            dominance = (raw_dominance + 1.0) / 2.0
             nrc_vad_lex[word] = (valence, arousal, dominance)
     return nrc_vad_lex
 

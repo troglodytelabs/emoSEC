@@ -31,7 +31,7 @@ It trains multiple classifiers—Logistic Regression, SVM, Naive Bayes, and Rand
 
 ---
 
-## Requirements
+## Setup
 
 ### Python Environment
 
@@ -49,3 +49,17 @@ You'll need to download them manually from the official sources and place them a
 
 - `data/NRC-Emotion-Lexicon-Wordlevel-v0.92.txt` - Download from: [NRC Emotion Lexicon](http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm)
 - `data/NRC-VAD-Lexicon-v2.1.txt` - Download from: [NRC VAD Lexicon](http://saifmohammad.com/WebPages/nrc-vad.html)
+
+### Running
+
+Configuration is centralized in `config.py` — edit this file before running to set:
+
+- Data and lexicon paths (e.g., NRC_EMOTION_PATH, NRC_VAD_PATH, etc.)
+- Feature flags and preprocessing (e.g., NGRAM_RANGE, TFIDF_FEATURES, etc.)
+- Model and training hyperparameters (e.g., SAMPLE_SIZE, TRAIN_SPLIT, USE_LOGISTIC_REGRESSION, USE_SVM, etc.)
+
+Save your changes to `config.py`, then run the pipeline using the project's entry point.
+
+```bash
+python METCS777-term-paper-code-sample-doc-Team6.py
+```
